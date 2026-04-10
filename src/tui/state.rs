@@ -1,11 +1,14 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use anyhow::{Result, bail};
 
 use crate::catalog::{Catalog, ExecutionPlan, MissingRequirementPolicy, TaskDefinition};
 use crate::persistence::{HistoryEntry, MAX_HISTORY_ENTRIES, PersistedProfile, PersistedState};
 use crate::profiles::{CUSTOM_PROFILE_ID, ProfileDefinition, built_in_profiles};
-use crate::runner::{OutcomeStatus, RunOptions, RunSummary, RunnerEvent, StreamKind};
+use crate::runner::{
+    OutcomeStatus, PreflightReport, RunOptions, RunSummary, RunnerEvent, StreamKind,
+    inspect_preflight,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -36,6 +39,59 @@ impl TaskState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvailabilityState {
+    Available,
+    WarnUnavailable,
+    FailUnavailable,
+}
+
+impl AvailabilityState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::WarnUnavailable => "warn-skip",
+            Self::FailUnavailable => "blocked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScopeFilter {
+    #[default]
+    All,
+    Selected,
+    Available,
+    Unavailable,
+}
+
+impl ScopeFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Selected => "selected",
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Selected,
+            Self::Selected => Self::Available,
+            Self::Available => Self::Unavailable,
+            Self::Unavailable => Self::All,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TaskFilter {
+    pub scope: ScopeFilter,
+    pub category: Option<String>,
+    pub tag: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskItem {
     pub id: String,
@@ -50,8 +106,16 @@ pub struct TaskItem {
     pub requires_commands: Vec<String>,
     pub requires_paths: Vec<String>,
     pub on_missing: MissingRequirementPolicy,
+    pub availability: AvailabilityState,
+    pub preflight_messages: Vec<String>,
     pub selected: bool,
     pub state: TaskState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskListEntry {
+    Header(String),
+    Task(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +142,7 @@ pub struct AppState {
     custom_profile: ProfileDefinition,
     active_profile_id: String,
     history: Vec<HistoryEntry>,
+    filter: TaskFilter,
     dirty: bool,
 }
 
@@ -126,6 +191,7 @@ impl AppState {
             custom_profile: custom_profile.clone(),
             active_profile_id,
             history: persisted.history,
+            filter: TaskFilter::default(),
             dirty: false,
         };
 
@@ -136,6 +202,7 @@ impl AppState {
             state.apply_active_profile();
         }
         state.custom_profile = custom_profile;
+        state.sync_selected_index();
 
         state
     }
@@ -146,6 +213,31 @@ impl AppState {
 
     pub fn selected_index(&self) -> usize {
         self.selected_index
+    }
+
+    pub fn selected_list_index(&self) -> Option<usize> {
+        self.task_list_entries().iter().position(
+            |entry| matches!(entry, TaskListEntry::Task(index) if *index == self.selected_index),
+        )
+    }
+
+    pub fn task_list_entries(&self) -> Vec<TaskListEntry> {
+        let mut grouped = BTreeMap::<String, Vec<usize>>::new();
+        for index in self.visible_task_indices() {
+            grouped
+                .entry(self.tasks[index].category.clone())
+                .or_default()
+                .push(index);
+        }
+
+        let mut entries = Vec::new();
+        for (category, indices) in grouped {
+            entries.push(TaskListEntry::Header(category));
+            for index in indices {
+                entries.push(TaskListEntry::Task(index));
+            }
+        }
+        entries
     }
 
     pub fn screen(&self) -> Screen {
@@ -174,6 +266,27 @@ impl AppState {
 
     pub fn selected_task(&self) -> &TaskItem {
         &self.tasks[self.selected_index]
+    }
+
+    pub fn selected_visible_task(&self) -> Option<&TaskItem> {
+        self.visible_task_indices()
+            .contains(&self.selected_index)
+            .then_some(&self.tasks[self.selected_index])
+    }
+
+    pub fn filter(&self) -> &TaskFilter {
+        &self.filter
+    }
+
+    pub fn filter_summary(&self) -> String {
+        let mut parts = vec![self.filter.scope.label().to_string()];
+        if let Some(category) = &self.filter.category {
+            parts.push(format!("category:{category}"));
+        }
+        if let Some(tag) = &self.filter.tag {
+            parts.push(format!("tag:{tag}"));
+        }
+        parts.join(" | ")
     }
 
     pub fn pending_danger_messages(&self) -> Vec<(String, String)> {
@@ -240,22 +353,32 @@ impl AppState {
     }
 
     pub fn move_next(&mut self) {
-        if self.tasks.is_empty() {
+        let visible = self.visible_task_indices();
+        if visible.is_empty() {
             return;
         }
 
-        self.selected_index = (self.selected_index + 1) % self.tasks.len();
+        let current_position = visible
+            .iter()
+            .position(|index| *index == self.selected_index)
+            .unwrap_or(0);
+        self.selected_index = visible[(current_position + 1) % visible.len()];
     }
 
     pub fn move_previous(&mut self) {
-        if self.tasks.is_empty() {
+        let visible = self.visible_task_indices();
+        if visible.is_empty() {
             return;
         }
 
-        self.selected_index = if self.selected_index == 0 {
-            self.tasks.len() - 1
+        let current_position = visible
+            .iter()
+            .position(|index| *index == self.selected_index)
+            .unwrap_or(0);
+        self.selected_index = if current_position == 0 {
+            *visible.last().expect("visible task")
         } else {
-            self.selected_index - 1
+            visible[current_position - 1]
         };
     }
 
@@ -333,6 +456,69 @@ impl AppState {
         self.cycle_profile(-1);
     }
 
+    pub fn cycle_scope_filter(&mut self) {
+        if self.screen != Screen::Select {
+            return;
+        }
+
+        self.filter.scope = self.filter.scope.next();
+        self.sync_selected_index();
+        self.status_message = Some(format!("Filter: {}", self.filter_summary()));
+    }
+
+    pub fn toggle_selected_category_filter(&mut self) {
+        if self.screen != Screen::Select {
+            return;
+        }
+
+        let Some(task) = self.selected_visible_task() else {
+            self.status_message = Some("No tasks match the current filters.".to_string());
+            return;
+        };
+
+        let category = task.category.clone();
+        if self.filter.category.as_deref() == Some(category.as_str()) {
+            self.filter.category = None;
+        } else {
+            self.filter.category = Some(category);
+        }
+        self.sync_selected_index();
+        self.status_message = Some(format!("Filter: {}", self.filter_summary()));
+    }
+
+    pub fn toggle_selected_tag_filter(&mut self) -> Result<()> {
+        if self.screen != Screen::Select {
+            return Ok(());
+        }
+
+        let Some(task) = self.selected_visible_task() else {
+            bail!("no tasks match the current filters");
+        };
+
+        let Some(tag) = task.tags.first().cloned() else {
+            bail!("selected task has no tags to filter by");
+        };
+
+        if self.filter.tag.as_deref() == Some(tag.as_str()) {
+            self.filter.tag = None;
+        } else {
+            self.filter.tag = Some(tag);
+        }
+        self.sync_selected_index();
+        self.status_message = Some(format!("Filter: {}", self.filter_summary()));
+        Ok(())
+    }
+
+    pub fn clear_filters(&mut self) {
+        if self.screen != Screen::Select {
+            return;
+        }
+
+        self.filter = TaskFilter::default();
+        self.sync_selected_index();
+        self.status_message = Some("Filters cleared.".to_string());
+    }
+
     pub fn prepare_run(&mut self) -> Result<Option<ExecutionPlan>> {
         self.status_message = None;
         let selected_ids = self.selected_task_ids();
@@ -382,6 +568,7 @@ impl AppState {
         for task in &mut self.tasks {
             task.state = TaskState::Pending;
         }
+        self.sync_selected_index();
     }
 
     pub fn rerun_failed(&mut self) -> Result<Option<ExecutionPlan>> {
@@ -520,6 +707,7 @@ impl AppState {
 
         self.status_message = Some(format!("Profile: {}", self.active_profile().label));
         self.dirty = true;
+        self.sync_selected_index();
     }
 
     fn apply_active_profile(&mut self) {
@@ -539,6 +727,7 @@ impl AppState {
         self.custom_profile = ProfileDefinition::custom(self.selected_task_ids(), self.options);
         self.status_message = Some("Profile: Custom".to_string());
         self.dirty = true;
+        self.sync_selected_index();
     }
 
     fn begin_run(&mut self) {
@@ -564,10 +753,67 @@ impl AppState {
             self.logs.pop_front();
         }
     }
+
+    fn visible_task_indices(&self) -> Vec<usize> {
+        let mut grouped = BTreeMap::<String, Vec<usize>>::new();
+        for (index, task) in self.tasks.iter().enumerate() {
+            if self.matches_filter(task) {
+                grouped
+                    .entry(task.category.clone())
+                    .or_default()
+                    .push(index);
+            }
+        }
+
+        let mut ordered = Vec::new();
+        for (_, indices) in grouped {
+            ordered.extend(indices);
+        }
+        ordered
+    }
+
+    fn matches_filter(&self, task: &TaskItem) -> bool {
+        let scope_match = match self.filter.scope {
+            ScopeFilter::All => true,
+            ScopeFilter::Selected => task.selected,
+            ScopeFilter::Available => task.availability == AvailabilityState::Available,
+            ScopeFilter::Unavailable => task.availability != AvailabilityState::Available,
+        };
+
+        let category_match = self
+            .filter
+            .category
+            .as_ref()
+            .is_none_or(|category| &task.category == category);
+        let tag_match = self
+            .filter
+            .tag
+            .as_ref()
+            .is_none_or(|tag| task.tags.iter().any(|task_tag| task_tag == tag));
+
+        scope_match && category_match && tag_match
+    }
+
+    fn sync_selected_index(&mut self) {
+        let visible = self.visible_task_indices();
+        if visible.is_empty() {
+            self.selected_index = 0;
+            return;
+        }
+
+        if !visible.contains(&self.selected_index) {
+            self.selected_index = visible[0];
+        }
+    }
 }
 
 impl TaskItem {
     fn from_definition(task: &TaskDefinition) -> Self {
+        let preflight = inspect_preflight(task).unwrap_or_else(|error| PreflightReport {
+            status: Some(OutcomeStatus::Fail),
+            messages: vec![format!("Preflight inspection failed: {error:#}")],
+        });
+
         Self {
             id: task.id.clone(),
             label: task.label.clone(),
@@ -581,6 +827,8 @@ impl TaskItem {
             requires_commands: task.preflight.requires_commands.clone(),
             requires_paths: task.preflight.requires_paths.clone(),
             on_missing: task.preflight.on_missing,
+            availability: AvailabilityState::from_preflight_status(preflight.status),
+            preflight_messages: preflight.messages,
             selected: task.default_selected,
             state: TaskState::Pending,
         }
@@ -593,6 +841,16 @@ impl TaskState {
             OutcomeStatus::Ok => Self::Ok,
             OutcomeStatus::Warn => Self::Warn,
             OutcomeStatus::Fail => Self::Fail,
+        }
+    }
+}
+
+impl AvailabilityState {
+    fn from_preflight_status(status: Option<OutcomeStatus>) -> Self {
+        match status {
+            None | Some(OutcomeStatus::Ok) => Self::Available,
+            Some(OutcomeStatus::Warn) => Self::WarnUnavailable,
+            Some(OutcomeStatus::Fail) => Self::FailUnavailable,
         }
     }
 }
@@ -610,14 +868,18 @@ fn merge_options(saved: RunOptions, launch: RunOptions) -> RunOptions {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::catalog::{Catalog, MissingRequirementPolicy, TaskDefinition, TaskRunner};
+    use crate::catalog::{
+        Catalog, MissingRequirementPolicy, TaskDefinition, TaskPreflight, TaskRunner,
+    };
     use crate::persistence::{HistoryEntry, HistorySummary, PersistedProfile, PersistedState};
     use crate::profiles::CUSTOM_PROFILE_ID;
     use crate::runner::{
         OutcomeStatus, RunOptions, RunSummary, RunnerEvent, StreamKind, TaskOutcome,
     };
 
-    use super::{AppState, CompletedRun, Screen, TaskState};
+    use super::{
+        AppState, AvailabilityState, CompletedRun, ScopeFilter, Screen, TaskListEntry, TaskState,
+    };
 
     #[test]
     fn starts_from_persisted_profile() {
@@ -665,6 +927,106 @@ mod tests {
         assert_eq!(state.active_profile().id, "full");
         state.cycle_profile_previous();
         assert_eq!(state.active_profile().id, CUSTOM_PROFILE_ID);
+    }
+
+    #[test]
+    fn cycles_scope_filters() {
+        let mut state = AppState::new(
+            catalog_fixture(),
+            RunOptions::default(),
+            PersistedState::default(),
+        );
+        assert_eq!(state.filter().scope, ScopeFilter::All);
+        state.cycle_scope_filter();
+        assert_eq!(state.filter().scope, ScopeFilter::Selected);
+        state.cycle_scope_filter();
+        assert_eq!(state.filter().scope, ScopeFilter::Available);
+        state.cycle_scope_filter();
+        assert_eq!(state.filter().scope, ScopeFilter::Unavailable);
+    }
+
+    #[test]
+    fn toggles_category_and_tag_filters_from_selected_task() {
+        let mut state = AppState::new(
+            catalog_fixture(),
+            RunOptions::default(),
+            PersistedState::default(),
+        );
+        state.selected_index = 1;
+        state.toggle_selected_category_filter();
+        assert_eq!(state.filter().category.as_deref(), Some("toolchain"));
+        state.toggle_selected_tag_filter().expect("tag filter");
+        assert_eq!(state.filter().tag.as_deref(), Some("sdk"));
+        state.clear_filters();
+        assert!(state.filter().category.is_none());
+        assert!(state.filter().tag.is_none());
+    }
+
+    #[test]
+    fn groups_visible_tasks_by_category() {
+        let state = AppState::new(
+            catalog_fixture(),
+            RunOptions::default(),
+            PersistedState::default(),
+        );
+        let entries = state.task_list_entries();
+        assert!(
+            matches!(entries[0], TaskListEntry::Header(ref category) if category == "package-manager")
+        );
+        assert!(entries.iter().any(
+            |entry| matches!(entry, TaskListEntry::Header(category) if category == "toolchain")
+        ));
+    }
+
+    #[test]
+    fn unavailable_filter_shows_only_unavailable_tasks() {
+        let mut state = AppState::new(
+            catalog_fixture(),
+            RunOptions::default(),
+            PersistedState::default(),
+        );
+        state.cycle_scope_filter();
+        state.cycle_scope_filter();
+        state.cycle_scope_filter();
+        let visible_ids = state
+            .task_list_entries()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                TaskListEntry::Task(index) => Some(state.tasks()[index].id.as_str()),
+                TaskListEntry::Header(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible_ids, vec!["sdkman"]);
+    }
+
+    #[test]
+    fn selected_task_tracks_visible_filter_space() {
+        let mut state = AppState::new(
+            catalog_fixture(),
+            RunOptions::default(),
+            PersistedState::default(),
+        );
+        state.selected_index = 1;
+        state.toggle_selected_tag_filter().expect("tag filter");
+        assert_eq!(state.selected_task().id, "flutter");
+        state.toggle_current();
+        assert_eq!(state.active_profile_id(), CUSTOM_PROFILE_ID);
+    }
+
+    #[test]
+    fn handles_empty_filtered_views_without_a_selected_task() {
+        let mut state = AppState::new(
+            catalog_fixture(),
+            RunOptions::default(),
+            PersistedState::default(),
+        );
+        state.selected_index = 0;
+        state.toggle_selected_tag_filter().expect("tag filter");
+        state.filter.category = Some("toolchain".to_string());
+        state.sync_selected_index();
+        assert!(state.task_list_entries().is_empty());
+        assert!(state.selected_visible_task().is_none());
+        assert!(state.toggle_selected_tag_filter().is_err());
     }
 
     #[test]
@@ -875,19 +1237,61 @@ mod tests {
 
     fn catalog_fixture() -> Catalog {
         Catalog::from_task_definitions(vec![
-            task("brew", "Homebrew", true, false, Vec::new()),
-            task("flutter", "Flutter", true, true, Vec::new()),
-            task("node", "Node", true, false, Vec::new()),
+            task(
+                "brew",
+                "Homebrew",
+                "package-manager",
+                vec!["packages"],
+                true,
+                false,
+                Vec::new(),
+            ),
+            task(
+                "flutter",
+                "Flutter",
+                "toolchain",
+                vec!["sdk", "destructive"],
+                true,
+                true,
+                Vec::new(),
+            ),
+            task(
+                "node",
+                "Node",
+                "toolchain",
+                vec!["runtime"],
+                true,
+                false,
+                Vec::new(),
+            ),
             task(
                 "npm-tools",
                 "npm tools",
+                "package-manager",
+                vec!["cli"],
                 true,
                 false,
                 vec!["node".to_string()],
             ),
-            task("rust", "Rust", false, false, Vec::new()),
-            task("julia", "Julia", false, false, Vec::new()),
-            task("sdkman", "SDKMAN", false, false, Vec::new()),
+            task(
+                "rust",
+                "Rust",
+                "toolchain",
+                vec!["runtime"],
+                false,
+                false,
+                Vec::new(),
+            ),
+            task(
+                "julia",
+                "Julia",
+                "toolchain",
+                vec!["runtime"],
+                false,
+                false,
+                Vec::new(),
+            ),
+            unavailable_task("sdkman", "SDKMAN", "toolchain"),
         ])
         .expect("catalog")
     }
@@ -895,6 +1299,8 @@ mod tests {
     fn task(
         id: &str,
         label: &str,
+        category: &str,
+        tags: Vec<&str>,
         default_selected: bool,
         dangerous: bool,
         dependencies: Vec<String>,
@@ -903,8 +1309,8 @@ mod tests {
             id: id.to_string(),
             label: label.to_string(),
             description: format!("{label} description"),
-            category: "general".to_string(),
-            tags: Vec::new(),
+            category: category.to_string(),
+            tags: tags.into_iter().map(ToString::to_string).collect(),
             notes: Vec::new(),
             default_selected,
             dangerous,
@@ -915,7 +1321,7 @@ mod tests {
             },
             dependencies,
             env: BTreeMap::new(),
-            preflight: crate::catalog::TaskPreflight {
+            preflight: TaskPreflight {
                 requires_commands: Vec::new(),
                 requires_paths: Vec::new(),
                 on_missing: MissingRequirementPolicy::Fail,
@@ -925,5 +1331,46 @@ mod tests {
                 args: vec![id.to_string()],
             },
         }
+    }
+
+    fn unavailable_task(id: &str, label: &str, category: &str) -> TaskDefinition {
+        TaskDefinition {
+            id: id.to_string(),
+            label: label.to_string(),
+            description: format!("{label} description"),
+            category: category.to_string(),
+            tags: vec!["manager".to_string()],
+            notes: Vec::new(),
+            default_selected: false,
+            dangerous: false,
+            danger_message: None,
+            dependencies: Vec::new(),
+            env: BTreeMap::new(),
+            preflight: TaskPreflight {
+                requires_commands: vec!["definitely-not-installed-upgrade-cockpit".to_string()],
+                requires_paths: Vec::new(),
+                on_missing: MissingRequirementPolicy::Warn,
+            },
+            runner: TaskRunner::Command {
+                program: "echo".to_string(),
+                args: vec![id.to_string()],
+            },
+        }
+    }
+
+    #[test]
+    fn marks_unavailable_tasks_from_preflight() {
+        let state = AppState::new(
+            catalog_fixture(),
+            RunOptions::default(),
+            PersistedState::default(),
+        );
+        let sdkman = state
+            .tasks()
+            .iter()
+            .find(|task| task.id == "sdkman")
+            .expect("sdkman");
+        assert_eq!(sdkman.availability, AvailabilityState::WarnUnavailable);
+        assert!(!sdkman.preflight_messages.is_empty());
     }
 }
