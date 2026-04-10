@@ -9,7 +9,7 @@ A Rust-powered terminal cockpit for running scripted system updates without turn
 - update tasks are defined as manifests in `tasks/`
 - each task runs a script or command from `scripts/`
 - Rust handles planning, dependency ordering, profiles, preflight checks, summaries, history, and the terminal UI
-- the default interactive experience is a ratatui control panel with live logs, recent runs, per-task status, and task safety notes
+- the default interactive experience is a ratatui control panel with grouped tasks, live logs, recent runs, per-task status, and task safety notes
 
 ## Project Shape
 
@@ -39,6 +39,10 @@ cargo run -- --dry-run run
 - `x` clears the selection
 - `p` cycles to the next profile
 - `Shift+P` cycles to the previous profile
+- `f` cycles task filter scope
+- `g` toggles a category filter from the selected task
+- `t` toggles a tag filter from the selected task
+- `z` clears active task filters
 - `d`, `v`, `c`, `u` toggle runtime options
 - `enter` starts a run
 - `r` reruns failed tasks from the summary screen

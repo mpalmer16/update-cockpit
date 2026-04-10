@@ -267,9 +267,13 @@ impl Runner {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PreflightResult {
-    status: Option<OutcomeStatus>,
-    messages: Vec<String>,
+pub struct PreflightReport {
+    pub status: Option<OutcomeStatus>,
+    pub messages: Vec<String>,
+}
+
+pub fn inspect_preflight(task: &TaskDefinition) -> Result<PreflightReport> {
+    evaluate_preflight(task)
 }
 
 fn build_command(task: &TaskDefinition, root: &PathBuf, options: &RunOptions) -> Command {
@@ -315,7 +319,7 @@ fn classify_exit_code(code: i32) -> OutcomeStatus {
     }
 }
 
-fn evaluate_preflight(task: &TaskDefinition) -> Result<PreflightResult> {
+fn evaluate_preflight(task: &TaskDefinition) -> Result<PreflightReport> {
     let mut missing = Vec::new();
 
     for command in &task.preflight.requires_commands {
@@ -332,7 +336,7 @@ fn evaluate_preflight(task: &TaskDefinition) -> Result<PreflightResult> {
     }
 
     if missing.is_empty() {
-        return Ok(PreflightResult {
+        return Ok(PreflightReport {
             status: None,
             messages: Vec::new(),
         });
@@ -354,7 +358,7 @@ fn evaluate_preflight(task: &TaskDefinition) -> Result<PreflightResult> {
         }
     });
 
-    Ok(PreflightResult {
+    Ok(PreflightReport {
         status: Some(status),
         messages,
     })

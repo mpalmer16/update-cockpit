@@ -16,10 +16,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use ratatui::{Frame, Terminal};
 
-use crate::catalog::{Catalog, ExecutionPlan};
+use crate::catalog::{Catalog, ExecutionPlan, MissingRequirementPolicy};
 use crate::persistence::{HistoryEntry, PersistedState, PersistenceStore};
 use crate::runner::{OutcomeStatus, RunOptions, Runner, RunnerEvent};
-use crate::tui::state::{AppState, CompletedRun, Screen, TaskItem, TaskState};
+use crate::tui::state::{
+    AppState, AvailabilityState, CompletedRun, Screen, TaskItem, TaskListEntry, TaskState,
+};
 
 enum AppEvent {
     Runner(RunnerEvent),
@@ -122,6 +124,14 @@ fn handle_key(
             KeyCode::Char('P') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 state.cycle_profile_previous()
             }
+            KeyCode::Char('f') => state.cycle_scope_filter(),
+            KeyCode::Char('g') => state.toggle_selected_category_filter(),
+            KeyCode::Char('t') => {
+                if let Err(error) = state.toggle_selected_tag_filter() {
+                    state.set_status_message(error.to_string());
+                }
+            }
+            KeyCode::Char('z') => state.clear_filters(),
             KeyCode::Enter => match state.prepare_run() {
                 Ok(Some(plan)) => spawn_run(root.clone(), plan, state, event_tx.clone()),
                 Ok(None) => {}
@@ -226,7 +236,7 @@ fn render(frame: &mut Frame, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(14),
+            Constraint::Min(16),
             Constraint::Length(10),
             Constraint::Length(2),
         ])
@@ -253,7 +263,11 @@ fn render_title(frame: &mut Frame, area: Rect, state: &AppState) {
         Screen::Running => 2,
         Screen::Summary => 3,
     };
-    let title = format!(" Upgrade Cockpit [{}] ", state.active_profile().label);
+    let title = format!(
+        " Upgrade Cockpit [{}] [{}] ",
+        state.active_profile().label,
+        state.filter_summary()
+    );
     let tabs = Tabs::new(titles)
         .select(active)
         .block(
@@ -271,7 +285,7 @@ fn render_title(frame: &mut Frame, area: Rect, state: &AppState) {
 fn render_main(frame: &mut Frame, area: Rect, state: &AppState) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(area);
 
     render_tasks(frame, columns[0], state);
@@ -279,15 +293,35 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_tasks(frame: &mut Frame, area: Rect, state: &AppState) {
-    let items = state
-        .tasks()
-        .iter()
-        .map(|task| ListItem::new(task_line(task)))
-        .collect::<Vec<_>>();
+    let entries = state.task_list_entries();
+    let items = if entries.is_empty() {
+        vec![ListItem::new(Line::styled(
+            " No tasks match the current filters. ",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ))]
+    } else {
+        entries
+            .iter()
+            .map(|entry| match entry {
+                TaskListEntry::Header(category) => ListItem::new(Line::styled(
+                    format!(" {} ", category),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Rgb(143, 185, 177))
+                        .add_modifier(Modifier::BOLD),
+                )),
+                TaskListEntry::Task(index) => ListItem::new(task_line(&state.tasks()[*index])),
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let title = format!(" Tasks [{}] ", state.filter_summary());
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Tasks ")
+                .title(title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Blue)),
         )
@@ -297,13 +331,19 @@ fn render_tasks(frame: &mut Frame, area: Rect, state: &AppState) {
                 .bg(Color::Rgb(28, 36, 49))
                 .add_modifier(Modifier::BOLD),
         );
-    let mut list_state = ListState::default().with_selected(Some(state.selected_index()));
+    let mut list_state = ListState::default().with_selected(state.selected_list_index());
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
 fn task_line(task: &TaskItem) -> Line<'static> {
     let checkbox = if task.selected { "[x]" } else { "[ ]" };
     let danger = if task.dangerous { " !" } else { "" };
+    let availability = match task.availability {
+        AvailabilityState::Available => "",
+        AvailabilityState::WarnUnavailable => " ~",
+        AvailabilityState::FailUnavailable => " x",
+    };
+
     Line::from(vec![
         Span::styled(
             format!("{checkbox} "),
@@ -313,10 +353,19 @@ fn task_line(task: &TaskItem) -> Line<'static> {
                 Color::DarkGray
             }),
         ),
-        Span::raw(task.label.clone()),
         Span::styled(
-            format!("  {}{danger}", task.state.label()),
-            task_state_style(task.state),
+            task.label.clone(),
+            match task.availability {
+                AvailabilityState::Available => Style::default().fg(Color::White),
+                AvailabilityState::WarnUnavailable => Style::default().fg(Color::Yellow),
+                AvailabilityState::FailUnavailable => Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            },
+        ),
+        Span::styled(
+            format!("  {}{danger}{availability}", task.state.label()),
+            task_state_style(task.state, task.availability),
         ),
     ])
 }
@@ -332,8 +381,8 @@ fn render_select_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(14),
-            Constraint::Length(7),
+            Constraint::Length(18),
+            Constraint::Length(8),
             Constraint::Min(6),
         ])
         .split(area);
@@ -344,7 +393,31 @@ fn render_select_detail(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_task_detail(frame: &mut Frame, area: Rect, state: &AppState) {
-    let task = state.selected_task();
+    let Some(task) = state.selected_visible_task() else {
+        let paragraph = Paragraph::new(vec![
+            Line::styled(
+                "No tasks match the current filters.",
+                Style::default().fg(Color::Yellow).bold(),
+            ),
+            Line::raw(""),
+            Line::raw("Clear the active filters or change the scope to see tasks again."),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("Active filter: ", Style::default().fg(Color::Gray)),
+                Span::raw(state.filter_summary()),
+            ]),
+        ])
+        .block(
+            Block::default()
+                .title(" Detail ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Blue)),
+        )
+        .wrap(Wrap { trim: true });
+        frame.render_widget(paragraph, area);
+        return;
+    };
+
     let dependencies = if task.dependencies.is_empty() {
         "none".to_string()
     } else {
@@ -386,6 +459,11 @@ fn render_task_detail(frame: &mut Frame, area: Rect, state: &AppState) {
                     Style::default().fg(Color::Green)
                 },
             ),
+            Span::raw(" "),
+            Span::styled(
+                task.availability.label(),
+                availability_style(task.availability),
+            ),
         ]),
         Line::raw(""),
         Line::raw(task.description.clone()),
@@ -422,8 +500,8 @@ fn render_task_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     lines.push(Line::from(vec![
         Span::styled("On missing: ", Style::default().fg(Color::Gray)),
         Span::raw(match task.on_missing {
-            crate::catalog::MissingRequirementPolicy::Warn => "warn and skip",
-            crate::catalog::MissingRequirementPolicy::Fail => "fail task",
+            MissingRequirementPolicy::Warn => "warn and skip",
+            MissingRequirementPolicy::Fail => "fail task",
         }),
     ]));
 
@@ -432,6 +510,14 @@ fn render_task_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         lines.push(Line::styled("Notes", Style::default().fg(Color::Gray)));
         for note in &task.notes {
             lines.push(Line::raw(format!("- {note}")));
+        }
+    }
+
+    if !task.preflight_messages.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("Preflight", Style::default().fg(Color::Gray)));
+        for message in &task.preflight_messages {
+            lines.push(Line::raw(format!("- {message}")));
         }
     }
 
@@ -472,6 +558,10 @@ fn render_profile_panel(frame: &mut Frame, area: Rect, state: &AppState) {
         Line::from(vec![
             Span::styled("Selection: ", Style::default().fg(Color::Gray)),
             Span::raw(selections),
+        ]),
+        Line::from(vec![
+            Span::styled("Filter: ", Style::default().fg(Color::Gray)),
+            Span::raw(state.filter_summary()),
         ]),
     ])
     .block(
@@ -603,7 +693,7 @@ fn render_logs(frame: &mut Frame, area: Rect, state: &AppState) {
 fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
     let message = state.status_message().unwrap_or(match state.screen() {
         Screen::Select => {
-            "j/k move   space toggle   p next profile   shift+p prev   d/v/c/u flags   enter run   q quit"
+            "j/k move   space toggle   p profile   f scope   g category   t tag   z clear   enter run   q quit"
         }
         Screen::ConfirmDangerous => "Dangerous tasks need confirmation.",
         Screen::Running => "Task output streams in real time. Quit is disabled while running.",
@@ -673,9 +763,13 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn task_state_style(state: TaskState) -> Style {
+fn task_state_style(state: TaskState, availability: AvailabilityState) -> Style {
     match state {
-        TaskState::Pending => Style::default().fg(Color::Gray),
+        TaskState::Pending => match availability {
+            AvailabilityState::Available => Style::default().fg(Color::Gray),
+            AvailabilityState::WarnUnavailable => Style::default().fg(Color::Yellow),
+            AvailabilityState::FailUnavailable => Style::default().fg(Color::DarkGray),
+        },
         TaskState::Running => Style::default().fg(Color::Cyan).bold(),
         TaskState::Ok => Style::default().fg(Color::Green).bold(),
         TaskState::Warn => Style::default().fg(Color::Yellow).bold(),
@@ -688,6 +782,14 @@ fn outcome_style(status: OutcomeStatus) -> Style {
         OutcomeStatus::Ok => Style::default().fg(Color::Green).bold(),
         OutcomeStatus::Warn => Style::default().fg(Color::Yellow).bold(),
         OutcomeStatus::Fail => Style::default().fg(Color::Red).bold(),
+    }
+}
+
+fn availability_style(state: AvailabilityState) -> Style {
+    match state {
+        AvailabilityState::Available => Style::default().fg(Color::Green),
+        AvailabilityState::WarnUnavailable => Style::default().fg(Color::Yellow).bold(),
+        AvailabilityState::FailUnavailable => Style::default().fg(Color::Red).bold(),
     }
 }
 
