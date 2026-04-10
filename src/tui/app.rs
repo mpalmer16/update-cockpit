@@ -238,7 +238,7 @@ fn render(frame: &mut Frame, state: &AppState) {
     render_footer(frame, layout[3], state);
 
     if state.screen() == Screen::ConfirmDangerous {
-        render_confirmation(frame, centered_rect(60, 30, frame.area()));
+        render_confirmation(frame, centered_rect(68, 45, frame.area()), state);
     }
 }
 
@@ -332,7 +332,7 @@ fn render_select_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(10),
+            Constraint::Length(14),
             Constraint::Length(7),
             Constraint::Min(6),
         ])
@@ -350,6 +350,21 @@ fn render_task_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         task.dependencies.join(", ")
     };
+    let tags = if task.tags.is_empty() {
+        "none".to_string()
+    } else {
+        task.tags.join(", ")
+    };
+    let required_commands = if task.requires_commands.is_empty() {
+        "none".to_string()
+    } else {
+        task.requires_commands.join(", ")
+    };
+    let required_paths = if task.requires_paths.is_empty() {
+        "none".to_string()
+    } else {
+        task.requires_paths.join(", ")
+    };
     let flags = vec![
         flag_span("dry-run", state.options().dry_run),
         flag_span("verbose", state.options().verbose),
@@ -357,7 +372,7 @@ fn render_task_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         flag_span("npm-audit", state.options().npm_audit),
     ];
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled(task.label.clone(), Style::default().fg(Color::Cyan).bold()),
             Span::raw(" "),
@@ -376,12 +391,52 @@ fn render_task_detail(frame: &mut Frame, area: Rect, state: &AppState) {
         Line::raw(task.description.clone()),
         Line::raw(""),
         Line::from(vec![
+            Span::styled("Category: ", Style::default().fg(Color::Gray)),
+            Span::raw(task.category.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Tags: ", Style::default().fg(Color::Gray)),
+            Span::raw(tags),
+        ]),
+        Line::from(vec![
             Span::styled("Dependencies: ", Style::default().fg(Color::Gray)),
             Span::raw(dependencies),
         ]),
-        Line::raw(""),
-        Line::from(flags),
     ];
+
+    if let Some(danger_message) = &task.danger_message {
+        lines.push(Line::from(vec![
+            Span::styled("Danger: ", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(danger_message.clone()),
+        ]));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("Requires commands: ", Style::default().fg(Color::Gray)),
+        Span::raw(required_commands),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Requires paths: ", Style::default().fg(Color::Gray)),
+        Span::raw(required_paths),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("On missing: ", Style::default().fg(Color::Gray)),
+        Span::raw(match task.on_missing {
+            crate::catalog::MissingRequirementPolicy::Warn => "warn and skip",
+            crate::catalog::MissingRequirementPolicy::Fail => "fail task",
+        }),
+    ]));
+
+    if !task.notes.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("Notes", Style::default().fg(Color::Gray)));
+        for note in &task.notes {
+            lines.push(Line::raw(format!("- {note}")));
+        }
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(flags));
 
     let paragraph = Paragraph::new(lines)
         .block(
@@ -561,25 +616,38 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_confirmation(frame: &mut Frame, area: Rect) {
-    let paragraph = Paragraph::new(vec![
+fn render_confirmation(frame: &mut Frame, area: Rect, state: &AppState) {
+    let mut lines = vec![
         Line::styled(
             "Dangerous tasks selected",
             Style::default().fg(Color::Yellow).bold(),
         ),
         Line::raw(""),
-        Line::raw("This run includes at least one task marked dangerous."),
-        Line::raw("Flutter currently resets local SDK changes before upgrading."),
+        Line::raw("This run includes tasks with explicit danger notes:"),
         Line::raw(""),
-        Line::raw("Press y to continue or n to cancel."),
-    ])
-    .block(
-        Block::default()
-            .title(" Confirm Run ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
-    )
-    .wrap(Wrap { trim: true });
+    ];
+
+    for (label, message) in state.pending_danger_messages() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{label}: "),
+                Style::default().fg(Color::Yellow).bold(),
+            ),
+            Span::raw(message),
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::raw("Press y to continue or n to cancel."));
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Confirm Run ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: true });
 
     frame.render_widget(Clear, area);
     frame.render_widget(paragraph, area);

@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use anyhow::{Result, bail};
 
-use crate::catalog::{Catalog, ExecutionPlan, TaskDefinition};
+use crate::catalog::{Catalog, ExecutionPlan, MissingRequirementPolicy, TaskDefinition};
 use crate::persistence::{HistoryEntry, MAX_HISTORY_ENTRIES, PersistedProfile, PersistedState};
 use crate::profiles::{CUSTOM_PROFILE_ID, ProfileDefinition, built_in_profiles};
 use crate::runner::{OutcomeStatus, RunOptions, RunSummary, RunnerEvent, StreamKind};
@@ -41,8 +41,15 @@ pub struct TaskItem {
     pub id: String,
     pub label: String,
     pub description: String,
+    pub category: String,
+    pub tags: Vec<String>,
+    pub notes: Vec<String>,
     pub dangerous: bool,
+    pub danger_message: Option<String>,
     pub dependencies: Vec<String>,
+    pub requires_commands: Vec<String>,
+    pub requires_paths: Vec<String>,
+    pub on_missing: MissingRequirementPolicy,
     pub selected: bool,
     pub state: TaskState,
 }
@@ -167,6 +174,25 @@ impl AppState {
 
     pub fn selected_task(&self) -> &TaskItem {
         &self.tasks[self.selected_index]
+    }
+
+    pub fn pending_danger_messages(&self) -> Vec<(String, String)> {
+        let Some(plan) = &self.pending_plan else {
+            return Vec::new();
+        };
+
+        plan.tasks
+            .iter()
+            .filter(|task| task.dangerous)
+            .map(|task| {
+                (
+                    task.label.clone(),
+                    task.danger_message.clone().unwrap_or_else(|| {
+                        "Marked dangerous, but no specific danger message was provided.".to_string()
+                    }),
+                )
+            })
+            .collect()
     }
 
     pub fn active_profile(&self) -> &ProfileDefinition {
@@ -546,8 +572,15 @@ impl TaskItem {
             id: task.id.clone(),
             label: task.label.clone(),
             description: task.description.clone(),
+            category: task.category.clone(),
+            tags: task.tags.clone(),
+            notes: task.notes.clone(),
             dangerous: task.dangerous,
+            danger_message: task.danger_message.clone(),
             dependencies: task.dependencies.clone(),
+            requires_commands: task.preflight.requires_commands.clone(),
+            requires_paths: task.preflight.requires_paths.clone(),
+            on_missing: task.preflight.on_missing,
             selected: task.default_selected,
             state: TaskState::Pending,
         }
@@ -577,7 +610,7 @@ fn merge_options(saved: RunOptions, launch: RunOptions) -> RunOptions {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::catalog::{Catalog, TaskDefinition, TaskRunner};
+    use crate::catalog::{Catalog, MissingRequirementPolicy, TaskDefinition, TaskRunner};
     use crate::persistence::{HistoryEntry, HistorySummary, PersistedProfile, PersistedState};
     use crate::profiles::CUSTOM_PROFILE_ID;
     use crate::runner::{
@@ -664,6 +697,10 @@ mod tests {
             PersistedState::default(),
         );
         state.prepare_run().expect("prepare run");
+        let messages = state.pending_danger_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].0, "Flutter");
+        assert!(messages[0].1.contains("destructive"));
         state.cancel_confirmation();
 
         assert_eq!(state.screen(), Screen::Select);
@@ -871,10 +908,18 @@ mod tests {
             notes: Vec::new(),
             default_selected,
             dangerous,
-            danger_message: None,
+            danger_message: if dangerous {
+                Some(format!("{label} has destructive side effects."))
+            } else {
+                None
+            },
             dependencies,
             env: BTreeMap::new(),
-            preflight: crate::catalog::TaskPreflight::default(),
+            preflight: crate::catalog::TaskPreflight {
+                requires_commands: Vec::new(),
+                requires_paths: Vec::new(),
+                on_missing: MissingRequirementPolicy::Fail,
+            },
             runner: TaskRunner::Command {
                 program: "echo".to_string(),
                 args: vec![id.to_string()],
