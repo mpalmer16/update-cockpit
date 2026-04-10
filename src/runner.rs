@@ -1,5 +1,8 @@
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 
 use anyhow::{Context, Result};
 
@@ -47,6 +50,43 @@ impl OutcomeStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunnerEvent {
+    TaskStarted {
+        task_id: String,
+        label: String,
+    },
+    OutputLine {
+        task_id: String,
+        stream: StreamKind,
+        line: String,
+    },
+    TaskFinished {
+        task_id: String,
+        label: String,
+        status: OutcomeStatus,
+    },
+}
+
+pub trait EventSink {
+    fn handle(&mut self, event: RunnerEvent);
+}
+
+impl<F> EventSink for F
+where
+    F: FnMut(RunnerEvent),
+{
+    fn handle(&mut self, event: RunnerEvent) {
+        self(event);
+    }
+}
+
 pub struct Runner {
     root: PathBuf,
 }
@@ -88,44 +128,63 @@ impl Runner {
         })
     }
 
-    fn run_task(&self, task: &TaskDefinition, options: &RunOptions) -> Result<OutcomeStatus> {
-        let mut command = match &task.runner {
-            TaskRunner::Script { path, shell, args } => {
-                let mut command = Command::new(shell);
-                command.arg(self.root.join(path));
-                command.args(args);
-                command
-            }
-            TaskRunner::Command { program, args } => {
-                let mut command = Command::new(program);
-                command.args(args);
-                command
-            }
-        };
+    pub fn run_with_events<S>(
+        &self,
+        plan: &ExecutionPlan,
+        options: &RunOptions,
+        sink: &mut S,
+    ) -> Result<RunSummary>
+    where
+        S: EventSink,
+    {
+        let mut outcomes = Vec::new();
+        let mut ok_count = 0;
+        let mut warn_count = 0;
+        let mut fail_count = 0;
 
-        command.current_dir(&self.root);
-        command.env("UC_REPO_ROOT", &self.root);
-        command.env("UC_DRY_RUN", bool_env(options.dry_run));
-        command.env("UC_VERBOSE", bool_env(options.verbose));
-        command.env("UC_BREW_CLEANUP", bool_env(options.brew_cleanup));
-        command.env("UC_NPM_AUDIT", bool_env(options.npm_audit));
-        command.env("UC_TASK_ID", &task.id);
-        for (key, value) in &task.env {
-            command.env(key, value);
+        for task in &plan.tasks {
+            sink.handle(RunnerEvent::TaskStarted {
+                task_id: task.id.clone(),
+                label: task.label.clone(),
+            });
+
+            let status = self.run_task_with_events(task, options, sink)?;
+            match status {
+                OutcomeStatus::Ok => ok_count += 1,
+                OutcomeStatus::Warn => warn_count += 1,
+                OutcomeStatus::Fail => fail_count += 1,
+            }
+
+            sink.handle(RunnerEvent::TaskFinished {
+                task_id: task.id.clone(),
+                label: task.label.clone(),
+                status,
+            });
+
+            outcomes.push(TaskOutcome {
+                id: task.id.clone(),
+                label: task.label.clone(),
+                status,
+            });
         }
+
+        Ok(RunSummary {
+            outcomes,
+            ok_count,
+            warn_count,
+            fail_count,
+        })
+    }
+
+    fn run_task(&self, task: &TaskDefinition, options: &RunOptions) -> Result<OutcomeStatus> {
+        let mut command = build_command(task, &self.root, options);
 
         let status = command
             .status()
             .with_context(|| format!("failed to execute task {}", task.id))?;
         let code = status.code().unwrap_or(1);
 
-        let outcome = if code == 0 {
-            OutcomeStatus::Ok
-        } else if code == WARN_EXIT_CODE {
-            OutcomeStatus::Warn
-        } else {
-            OutcomeStatus::Fail
-        };
+        let outcome = classify_exit_code(code);
 
         if matches!(outcome, OutcomeStatus::Fail) {
             eprintln!("{} failed (exit {}).", task.label, code);
@@ -133,10 +192,111 @@ impl Runner {
 
         Ok(outcome)
     }
+
+    fn run_task_with_events<S>(
+        &self,
+        task: &TaskDefinition,
+        options: &RunOptions,
+        sink: &mut S,
+    ) -> Result<OutcomeStatus>
+    where
+        S: EventSink,
+    {
+        let mut command = build_command(task, &self.root, options);
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to execute task {}", task.id))?;
+        let stdout = child.stdout.take().context("child stdout not captured")?;
+        let stderr = child.stderr.take().context("child stderr not captured")?;
+        let (tx, rx) = mpsc::channel();
+
+        let stdout_tx = tx.clone();
+        let stdout_task_id = task.id.clone();
+        let stdout_thread = thread::spawn(move || {
+            read_stream(stdout, StreamKind::Stdout, stdout_task_id, stdout_tx)
+        });
+
+        let stderr_tx = tx;
+        let stderr_task_id = task.id.clone();
+        let stderr_thread = thread::spawn(move || {
+            read_stream(stderr, StreamKind::Stderr, stderr_task_id, stderr_tx)
+        });
+
+        for event in rx {
+            sink.handle(event);
+        }
+
+        stdout_thread.join().expect("stdout reader panicked")?;
+        stderr_thread.join().expect("stderr reader panicked")?;
+
+        let status = child.wait().context("failed to wait on task process")?;
+        Ok(classify_exit_code(status.code().unwrap_or(1)))
+    }
+}
+
+fn build_command(task: &TaskDefinition, root: &PathBuf, options: &RunOptions) -> Command {
+    let mut command = match &task.runner {
+        TaskRunner::Script { path, shell, args } => {
+            let mut command = Command::new(shell);
+            command.arg(root.join(path));
+            command.args(args);
+            command
+        }
+        TaskRunner::Command { program, args } => {
+            let mut command = Command::new(program);
+            command.args(args);
+            command
+        }
+    };
+
+    command.current_dir(root);
+    command.env("UC_REPO_ROOT", root);
+    command.env("UC_DRY_RUN", bool_env(options.dry_run));
+    command.env("UC_VERBOSE", bool_env(options.verbose));
+    command.env("UC_BREW_CLEANUP", bool_env(options.brew_cleanup));
+    command.env("UC_NPM_AUDIT", bool_env(options.npm_audit));
+    command.env("UC_TASK_ID", &task.id);
+    for (key, value) in &task.env {
+        command.env(key, value);
+    }
+
+    command
 }
 
 fn bool_env(value: bool) -> &'static str {
     if value { "1" } else { "0" }
+}
+
+fn classify_exit_code(code: i32) -> OutcomeStatus {
+    if code == 0 {
+        OutcomeStatus::Ok
+    } else if code == WARN_EXIT_CODE {
+        OutcomeStatus::Warn
+    } else {
+        OutcomeStatus::Fail
+    }
+}
+
+fn read_stream<R: std::io::Read + Send + 'static>(
+    reader: R,
+    stream: StreamKind,
+    task_id: String,
+    sender: mpsc::Sender<RunnerEvent>,
+) -> Result<()> {
+    for line in BufReader::new(reader).lines() {
+        sender
+            .send(RunnerEvent::OutputLine {
+                task_id: task_id.clone(),
+                stream,
+                line: line?,
+            })
+            .ok();
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -148,7 +308,7 @@ mod tests {
 
     use crate::catalog::{ExecutionPlan, TaskDefinition, TaskRunner};
 
-    use super::{OutcomeStatus, RunOptions, Runner};
+    use super::{OutcomeStatus, RunOptions, Runner, RunnerEvent, StreamKind};
 
     #[test]
     fn classifies_task_outcomes() {
@@ -235,6 +395,55 @@ exit 0
 
         let contents = fs::read_to_string(output_path).expect("read output");
         assert_eq!(contents, "1:1:1:1");
+    }
+
+    #[test]
+    fn emits_runner_events() {
+        let root = TempDir::new().expect("tempdir");
+        let scripts_dir = root.path().join("scripts");
+        fs::create_dir(&scripts_dir).expect("create scripts dir");
+
+        write_script(
+            &scripts_dir.join("events.sh"),
+            r#"#!/bin/sh
+echo "line 1"
+echo "line 2"
+exit 0
+"#,
+        );
+
+        let plan = ExecutionPlan {
+            tasks: vec![task("events", "scripts/events.sh")],
+        };
+        let mut events = Vec::new();
+
+        let summary = Runner::new(root.path().to_path_buf())
+            .run_with_events(&plan, &default_options(), &mut |event| events.push(event))
+            .expect("run task");
+
+        assert_eq!(summary.ok_count, 1);
+        assert!(matches!(
+            events.first(),
+            Some(RunnerEvent::TaskStarted { task_id, .. }) if task_id == "events"
+        ));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                RunnerEvent::OutputLine {
+                    task_id,
+                    stream: StreamKind::Stdout,
+                    line,
+                } if task_id == "events" && line == "line 1"
+            )
+        }));
+        assert!(matches!(
+            events.last(),
+            Some(RunnerEvent::TaskFinished {
+                task_id,
+                status: OutcomeStatus::Ok,
+                ..
+            }) if task_id == "events"
+        ));
     }
 
     fn task(id: &str, path: &str) -> TaskDefinition {
