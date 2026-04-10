@@ -1,6 +1,16 @@
 id = "sdkman"
 label = "SDKMAN"
 description = "Refresh SDKMAN metadata and upgrade installed SDKs."
+category = "toolchain"
+tags = ["sdkman", "runtime-manager"]
+notes = [
+  "Initializes SDKMAN in a shell before running selfupdate, update, and upgrade.",
+  "Treats SDKMAN command failures as warnings so the rest of the run can continue.",
+]
+
+[preflight]
+requires_paths = ["$HOME/.sdkman/bin/sdkman-init.sh"]
+on_missing = "warn"
 
 [runner]
 kind = "script"

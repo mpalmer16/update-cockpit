@@ -1,6 +1,16 @@
 id = "node"
 label = "Node (nvm stable)"
 description = "Install the latest stable Node release and make it the default."
+category = "toolchain"
+tags = ["language", "runtime", "nvm"]
+notes = [
+  "Uses nvm to install the stable Node line.",
+  "Reinstalls packages from the current version onto stable.",
+]
+
+[preflight]
+requires_paths = ["$HOME/.nvm/nvm.sh"]
+on_missing = "warn"
 
 [runner]
 kind = "script"

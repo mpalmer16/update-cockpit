@@ -1,7 +1,17 @@
 id = "npm-tools"
 label = "npm tools"
 description = "Update globally installed AI CLI tools on the stable Node runtime."
+category = "package-manager"
+tags = ["cli", "npm", "global-tools"]
+notes = [
+  "Uses the stable Node runtime through nvm first.",
+  "Can optionally run a global npm audit as a warn-only check.",
+]
 dependencies = ["node"]
+
+[preflight]
+requires_paths = ["$HOME/.nvm/nvm.sh"]
+on_missing = "warn"
 
 [runner]
 kind = "script"

@@ -11,15 +11,43 @@ pub struct TaskDefinition {
     pub label: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default = "default_category")]
+    pub category: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub notes: Vec<String>,
     #[serde(default = "default_true")]
     pub default_selected: bool,
     #[serde(default)]
     pub dangerous: bool,
     #[serde(default)]
+    pub danger_message: Option<String>,
+    #[serde(default)]
     pub dependencies: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub preflight: TaskPreflight,
     pub runner: TaskRunner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+pub struct TaskPreflight {
+    #[serde(default)]
+    pub requires_commands: Vec<String>,
+    #[serde(default)]
+    pub requires_paths: Vec<String>,
+    #[serde(default)]
+    pub on_missing: MissingRequirementPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingRequirementPolicy {
+    Warn,
+    #[default]
+    Fail,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -186,13 +214,17 @@ fn default_shell() -> String {
     "zsh".to_string()
 }
 
+fn default_category() -> String {
+    "general".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use tempfile::TempDir;
 
-    use super::Catalog;
+    use super::{Catalog, MissingRequirementPolicy};
 
     #[test]
     fn loads_task_manifests() {
@@ -217,6 +249,11 @@ mod tests {
         let tasks: Vec<_> = catalog.tasks().collect();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "rust");
+        assert_eq!(tasks[0].category, "general");
+        assert_eq!(
+            tasks[0].preflight.on_missing,
+            MissingRequirementPolicy::Fail
+        );
     }
 
     #[test]
@@ -391,5 +428,51 @@ mod tests {
     fn rejects_empty_catalog() {
         let error = Catalog::from_task_definitions(Vec::new()).expect_err("should fail");
         assert!(error.to_string().contains("no task definitions"));
+    }
+
+    #[test]
+    fn loads_task_metadata() {
+        let root = TempDir::new().expect("tempdir");
+        let tasks_dir = root.path().join("tasks");
+        fs::create_dir(&tasks_dir).expect("create tasks dir");
+        fs::write(
+            tasks_dir.join("flutter.toml"),
+            r#"
+                id = "flutter"
+                label = "Flutter"
+                category = "toolchain"
+                tags = ["sdk", "destructive"]
+                notes = ["Uses the stable channel.", "Resets local SDK changes first."]
+                dangerous = true
+                danger_message = "Resets the Flutter SDK checkout before upgrade."
+
+                [preflight]
+                requires_commands = ["flutter", "git"]
+                requires_paths = ["~/sdk/flutter"]
+                on_missing = "warn"
+
+                [runner]
+                kind = "command"
+                program = "echo"
+                args = ["flutter"]
+            "#,
+        )
+        .expect("write manifest");
+
+        let catalog = Catalog::load_from_tasks_dir(&tasks_dir).expect("load catalog");
+        let task = catalog.tasks().next().expect("task");
+        assert_eq!(task.category, "toolchain");
+        assert_eq!(
+            task.tags,
+            vec!["sdk".to_string(), "destructive".to_string()]
+        );
+        assert_eq!(task.notes.len(), 2);
+        assert_eq!(
+            task.danger_message.as_deref(),
+            Some("Resets the Flutter SDK checkout before upgrade.")
+        );
+        assert_eq!(task.preflight.requires_commands, vec!["flutter", "git"]);
+        assert_eq!(task.preflight.requires_paths, vec!["~/sdk/flutter"]);
+        assert_eq!(task.preflight.on_missing, MissingRequirementPolicy::Warn);
     }
 }

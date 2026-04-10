@@ -1,6 +1,13 @@
 id = "rust"
 label = "Rust"
 description = "Update installed Rust toolchains via rustup."
+category = "toolchain"
+tags = ["language", "runtime"]
+notes = ["Uses rustup to update all installed Rust toolchains and components."]
+
+[preflight]
+requires_commands = ["rustup"]
+on_missing = "fail"
 
 [runner]
 kind = "script"
