@@ -54,6 +54,34 @@ impl Catalog {
         Self::load_from_tasks_dir(&root.join("tasks"))
     }
 
+    pub fn from_task_definitions(tasks: impl IntoIterator<Item = TaskDefinition>) -> Result<Self> {
+        let mut task_map = BTreeMap::new();
+
+        for task in tasks {
+            if task_map.insert(task.id.clone(), task.clone()).is_some() {
+                bail!("duplicate task id {}", task.id);
+            }
+        }
+
+        if task_map.is_empty() {
+            bail!("no task definitions supplied");
+        }
+
+        for task in task_map.values() {
+            for dependency in &task.dependencies {
+                if !task_map.contains_key(dependency) {
+                    bail!(
+                        "task {} references unknown dependency {}",
+                        task.id,
+                        dependency
+                    );
+                }
+            }
+        }
+
+        Ok(Self { tasks: task_map })
+    }
+
     pub fn load_from_tasks_dir(tasks_dir: &Path) -> Result<Self> {
         let mut tasks = BTreeMap::new();
 
@@ -80,19 +108,7 @@ impl Catalog {
             bail!("no task manifests found in {}", tasks_dir.display());
         }
 
-        for task in tasks.values() {
-            for dependency in &task.dependencies {
-                if !tasks.contains_key(dependency) {
-                    bail!(
-                        "task {} references unknown dependency {}",
-                        task.id,
-                        dependency
-                    );
-                }
-            }
-        }
-
-        Ok(Self { tasks })
+        Self::from_task_definitions(tasks.into_values())
     }
 
     pub fn tasks(&self) -> impl Iterator<Item = &TaskDefinition> {
@@ -369,5 +385,11 @@ mod tests {
 
         let error = Catalog::load_from_tasks_dir(&tasks_dir).expect_err("should fail");
         assert!(error.to_string().contains("unknown dependency"));
+    }
+
+    #[test]
+    fn rejects_empty_catalog() {
+        let error = Catalog::from_task_definitions(Vec::new()).expect_err("should fail");
+        assert!(error.to_string().contains("no task definitions"));
     }
 }

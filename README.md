@@ -1,24 +1,40 @@
 # upgrade-cockpit
 
-A terminal-first control panel for running and managing system update tasks.
+A Rust-powered terminal cockpit for running scripted system updates without turning your shell history into a maintenance log.
 
-## Current Status
+## Overview
 
-The first implementation slice focuses on the non-TUI execution core:
+`upgrade-cockpit` keeps the update logic simple and the orchestration interesting:
 
-- task manifests in `tasks/`
-- shell-based task implementations in `scripts/`
-- a Rust runner with dependency-aware planning
-- unit coverage for CLI parsing, manifest validation, planning, and execution status handling
+- update tasks are defined as manifests in `tasks/`
+- each task runs a script or command from `scripts/`
+- Rust handles planning, dependency ordering, selection, summaries, and the terminal UI
+- the default interactive experience is a ratatui control panel with live logs and per-task status
+
+## Project Shape
+
+- `src/runner.rs` executes tasks and classifies `OK`, `WARN`, and `FAIL` outcomes
+- `src/tui/` contains the interactive shell and state model
+- `tasks/` declares what exists and how tasks depend on each other
+- `scripts/` preserves the shell-native behavior for tools like `nvm`, `sdkman`, `brew`, and `flutter`
 
 ## Commands
 
 ```bash
+cargo run
+cargo run -- tui
 cargo run -- list
 cargo run -- plan npm-tools
 cargo run -- --dry-run run
 ```
 
-## Next Step
+## TUI Controls
 
-Build the TUI on top of the existing runner instead of mixing terminal rendering into the execution layer.
+- `j` / `k` or arrow keys move through tasks
+- `space` toggles a task
+- `a` selects all tasks
+- `x` clears the selection
+- `d`, `v`, `c`, `u` toggle runtime options
+- `enter` starts a run
+- `r` reruns failed tasks from the summary screen
+- `q` quits
