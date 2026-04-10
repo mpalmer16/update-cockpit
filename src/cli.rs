@@ -31,8 +31,9 @@ impl Cli {
     }
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum Command {
+    Tui,
     List,
     Plan {
         #[arg(long)]
@@ -81,5 +82,11 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_explicit_tui_subcommand() {
+        let cli = Cli::try_parse_from(["upgrade-cockpit", "tui"]).expect("parse cli");
+        assert!(matches!(cli.command, Some(Command::Tui)));
     }
 }

@@ -106,6 +106,10 @@ impl AppState {
         self.status_message.as_deref()
     }
 
+    pub fn set_status_message(&mut self, message: impl Into<String>) {
+        self.status_message = Some(message.into());
+    }
+
     pub fn selected_task(&self) -> &TaskItem {
         &self.tasks[self.selected_index]
     }
@@ -237,6 +241,26 @@ impl AppState {
         for task in &mut self.tasks {
             task.state = TaskState::Pending;
         }
+    }
+
+    pub fn rerun_failed(&mut self) -> Result<Option<ExecutionPlan>> {
+        let failed_ids = self
+            .tasks
+            .iter()
+            .filter(|task| task.state == TaskState::Fail)
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+
+        if failed_ids.is_empty() {
+            bail!("no failed tasks to rerun");
+        }
+
+        self.screen = Screen::Select;
+        for task in &mut self.tasks {
+            task.selected = failed_ids.contains(&task.id);
+        }
+
+        self.prepare_run()
     }
 
     pub fn handle_runner_event(&mut self, event: RunnerEvent) {
@@ -431,6 +455,34 @@ mod tests {
         assert_eq!(state.tasks()[0].state, TaskState::Warn);
         assert!(state.logs().iter().any(|line| line.contains("updating")));
         assert_eq!(state.summary().expect("summary").warn_count, 1);
+    }
+
+    #[test]
+    fn reruns_only_failed_tasks() {
+        let mut state = AppState::new(catalog_fixture(), default_options());
+        state.finish_run(Ok(RunSummary {
+            outcomes: vec![
+                TaskOutcome {
+                    id: "brew".to_string(),
+                    label: "Homebrew".to_string(),
+                    status: OutcomeStatus::Fail,
+                },
+                TaskOutcome {
+                    id: "node".to_string(),
+                    label: "Node".to_string(),
+                    status: OutcomeStatus::Ok,
+                },
+            ],
+            ok_count: 1,
+            warn_count: 0,
+            fail_count: 1,
+        }));
+        state.tasks[0].state = TaskState::Fail;
+        state.tasks[2].state = TaskState::Ok;
+
+        let plan = state.rerun_failed().expect("rerun").expect("plan");
+        let ids: Vec<_> = plan.tasks.iter().map(|task| task.id.as_str()).collect();
+        assert_eq!(ids, vec!["brew"]);
     }
 
     fn catalog_fixture() -> Catalog {
