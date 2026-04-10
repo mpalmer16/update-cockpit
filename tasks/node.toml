@@ -1,0 +1,7 @@
+id = "node"
+label = "Node (nvm stable)"
+description = "Install the latest stable Node release and make it the default."
+
+[runner]
+kind = "script"
+path = "scripts/node.zsh"

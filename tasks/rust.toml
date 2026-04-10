@@ -1,0 +1,7 @@
+id = "rust"
+label = "Rust"
+description = "Update installed Rust toolchains via rustup."
+
+[runner]
+kind = "script"
+path = "scripts/rust.zsh"

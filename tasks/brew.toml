@@ -1,0 +1,7 @@
+id = "brew"
+label = "Homebrew"
+description = "Update Homebrew formulae and casks."
+
+[runner]
+kind = "script"
+path = "scripts/brew.zsh"

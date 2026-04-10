@@ -1,0 +1,8 @@
+id = "npm-tools"
+label = "npm tools"
+description = "Update globally installed AI CLI tools on the stable Node runtime."
+dependencies = ["node"]
+
+[runner]
+kind = "script"
+path = "scripts/npm-tools.zsh"

@@ -1,0 +1,7 @@
+id = "julia"
+label = "Julia"
+description = "Update installed Julia versions via juliaup."
+
+[runner]
+kind = "script"
+path = "scripts/julia.zsh"

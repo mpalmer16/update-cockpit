@@ -1,0 +1,8 @@
+id = "flutter"
+label = "Flutter"
+description = "Reset local Flutter SDK changes, switch to stable, and upgrade."
+dangerous = true
+
+[runner]
+kind = "script"
+path = "scripts/flutter.zsh"

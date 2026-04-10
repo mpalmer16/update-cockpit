@@ -1,0 +1,7 @@
+id = "sdkman"
+label = "SDKMAN"
+description = "Refresh SDKMAN metadata and upgrade installed SDKs."
+
+[runner]
+kind = "script"
+path = "scripts/sdkman.zsh"
