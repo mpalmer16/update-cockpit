@@ -1,6 +1,16 @@
 id = "brew"
 label = "Homebrew"
 description = "Update Homebrew formulae and casks."
+category = "package-manager"
+tags = ["packages", "macos"]
+notes = [
+  "Updates both formulae and casks.",
+  "Optional cleanup can run autoremove and cleanup after upgrade.",
+]
+
+[preflight]
+requires_commands = ["brew"]
+on_missing = "fail"
 
 [runner]
 kind = "script"

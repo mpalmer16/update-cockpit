@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -7,7 +8,7 @@ use std::thread;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{ExecutionPlan, TaskDefinition, TaskRunner};
+use crate::catalog::{ExecutionPlan, MissingRequirementPolicy, TaskDefinition, TaskRunner};
 
 const WARN_EXIT_CODE: i32 = 10;
 
@@ -182,6 +183,17 @@ impl Runner {
     }
 
     fn run_task(&self, task: &TaskDefinition, options: &RunOptions) -> Result<OutcomeStatus> {
+        let preflight = evaluate_preflight(task)?;
+        for message in &preflight.messages {
+            println!("{message}");
+        }
+        if let Some(status) = preflight.status {
+            if matches!(status, OutcomeStatus::Fail) {
+                eprintln!("{} failed during preflight.", task.label);
+            }
+            return Ok(status);
+        }
+
         let mut command = build_command(task, &self.root, options);
 
         let status = command
@@ -207,6 +219,18 @@ impl Runner {
     where
         S: EventSink,
     {
+        let preflight = evaluate_preflight(task)?;
+        for message in &preflight.messages {
+            sink.handle(RunnerEvent::OutputLine {
+                task_id: task.id.clone(),
+                stream: StreamKind::Stderr,
+                line: message.clone(),
+            });
+        }
+        if let Some(status) = preflight.status {
+            return Ok(status);
+        }
+
         let mut command = build_command(task, &self.root, options);
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
@@ -240,6 +264,12 @@ impl Runner {
         let status = child.wait().context("failed to wait on task process")?;
         Ok(classify_exit_code(status.code().unwrap_or(1)))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreflightResult {
+    status: Option<OutcomeStatus>,
+    messages: Vec<String>,
 }
 
 fn build_command(task: &TaskDefinition, root: &PathBuf, options: &RunOptions) -> Command {
@@ -285,6 +315,98 @@ fn classify_exit_code(code: i32) -> OutcomeStatus {
     }
 }
 
+fn evaluate_preflight(task: &TaskDefinition) -> Result<PreflightResult> {
+    let mut missing = Vec::new();
+
+    for command in &task.preflight.requires_commands {
+        if !command_available(command) {
+            missing.push(format!("Missing command: {command}"));
+        }
+    }
+
+    for path in &task.preflight.requires_paths {
+        let expanded = expand_path(path)?;
+        if !expanded.exists() {
+            missing.push(format!("Missing path: {}", expanded.display()));
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(PreflightResult {
+            status: None,
+            messages: Vec::new(),
+        });
+    }
+
+    let status = match task.preflight.on_missing {
+        MissingRequirementPolicy::Warn => OutcomeStatus::Warn,
+        MissingRequirementPolicy::Fail => OutcomeStatus::Fail,
+    };
+
+    let mut messages = vec![format!("Preflight for {}:", task.label)];
+    messages.extend(missing);
+    messages.push(match task.preflight.on_missing {
+        MissingRequirementPolicy::Warn => {
+            "Task skipped with warning because required tools are unavailable.".to_string()
+        }
+        MissingRequirementPolicy::Fail => {
+            "Task cannot run because required tools are unavailable.".to_string()
+        }
+    });
+
+    Ok(PreflightResult {
+        status: Some(status),
+        messages,
+    })
+}
+
+fn expand_path(path: &str) -> Result<PathBuf> {
+    if path == "~" {
+        let home = std::env::var("HOME").context("HOME is not set")?;
+        return Ok(PathBuf::from(home));
+    }
+
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var("HOME").context("HOME is not set")?;
+        return Ok(PathBuf::from(home).join(rest));
+    }
+
+    if let Some(rest) = path.strip_prefix("$HOME/") {
+        let home = std::env::var("HOME").context("HOME is not set")?;
+        return Ok(PathBuf::from(home).join(rest));
+    }
+
+    Ok(PathBuf::from(path))
+}
+
+fn command_available(command: &str) -> bool {
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        return Path::new(command).exists();
+    }
+
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+
+    std::env::split_paths(&path_var).any(|path| {
+        let candidate = path.join(command);
+        if candidate.is_file() {
+            return true;
+        }
+
+        #[cfg(windows)]
+        {
+            let exe = path.join(format!("{command}.exe"));
+            exe.is_file()
+        }
+
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    })
+}
+
 fn read_stream<R: std::io::Read + Send + 'static>(
     reader: R,
     stream: StreamKind,
@@ -311,7 +433,9 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use crate::catalog::{ExecutionPlan, TaskDefinition, TaskRunner};
+    use crate::catalog::{
+        ExecutionPlan, MissingRequirementPolicy, TaskDefinition, TaskPreflight, TaskRunner,
+    };
 
     use super::{OutcomeStatus, RunOptions, Runner, RunnerEvent, StreamKind};
 
@@ -451,19 +575,134 @@ exit 0
         ));
     }
 
+    #[test]
+    fn preflight_can_warn_and_skip_task() {
+        let root = TempDir::new().expect("tempdir");
+        let plan = ExecutionPlan {
+            tasks: vec![task_with_preflight(
+                "warn",
+                TaskPreflight {
+                    requires_commands: vec!["definitely-not-installed-upgrade-cockpit".to_string()],
+                    requires_paths: Vec::new(),
+                    on_missing: MissingRequirementPolicy::Warn,
+                },
+            )],
+        };
+
+        let summary = Runner::new(root.path().to_path_buf())
+            .run(&plan, &default_options())
+            .expect("run tasks");
+
+        assert_eq!(summary.warn_count, 1);
+        assert_eq!(summary.outcomes[0].status, OutcomeStatus::Warn);
+    }
+
+    #[test]
+    fn preflight_can_fail_task() {
+        let root = TempDir::new().expect("tempdir");
+        let plan = ExecutionPlan {
+            tasks: vec![task_with_preflight(
+                "fail",
+                TaskPreflight {
+                    requires_commands: vec!["definitely-not-installed-upgrade-cockpit".to_string()],
+                    requires_paths: Vec::new(),
+                    on_missing: MissingRequirementPolicy::Fail,
+                },
+            )],
+        };
+
+        let summary = Runner::new(root.path().to_path_buf())
+            .run(&plan, &default_options())
+            .expect("run tasks");
+
+        assert_eq!(summary.fail_count, 1);
+        assert_eq!(summary.outcomes[0].status, OutcomeStatus::Fail);
+    }
+
+    #[test]
+    fn expands_home_paths_for_preflight() {
+        let temp = TempDir::new().expect("tempdir");
+        let previous_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+        }
+        fs::write(temp.path().join("present.txt"), "ok").expect("write file");
+
+        let result = super::evaluate_preflight(&TaskDefinition {
+            id: "path".to_string(),
+            label: "Path".to_string(),
+            description: String::new(),
+            category: "general".to_string(),
+            tags: Vec::new(),
+            notes: Vec::new(),
+            default_selected: true,
+            dangerous: false,
+            danger_message: None,
+            dependencies: Vec::new(),
+            env: Default::default(),
+            preflight: TaskPreflight {
+                requires_commands: Vec::new(),
+                requires_paths: vec!["~/present.txt".to_string()],
+                on_missing: MissingRequirementPolicy::Fail,
+            },
+            runner: TaskRunner::Command {
+                program: "echo".to_string(),
+                args: vec!["path".to_string()],
+            },
+        })
+        .expect("preflight");
+
+        match previous_home {
+            Some(value) => unsafe {
+                std::env::set_var("HOME", value);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+
+        assert!(result.status.is_none());
+    }
+
     fn task(id: &str, path: &str) -> TaskDefinition {
         TaskDefinition {
             id: id.to_string(),
             label: id.to_string(),
             description: String::new(),
+            category: "general".to_string(),
+            tags: Vec::new(),
+            notes: Vec::new(),
             default_selected: true,
             dangerous: false,
+            danger_message: None,
             dependencies: Vec::new(),
             env: Default::default(),
+            preflight: TaskPreflight::default(),
             runner: TaskRunner::Script {
                 path: path.into(),
                 shell: "sh".to_string(),
                 args: Vec::new(),
+            },
+        }
+    }
+
+    fn task_with_preflight(id: &str, preflight: TaskPreflight) -> TaskDefinition {
+        TaskDefinition {
+            id: id.to_string(),
+            label: id.to_string(),
+            description: String::new(),
+            category: "general".to_string(),
+            tags: Vec::new(),
+            notes: Vec::new(),
+            default_selected: true,
+            dangerous: false,
+            danger_message: None,
+            dependencies: Vec::new(),
+            env: Default::default(),
+            preflight,
+            runner: TaskRunner::Command {
+                program: "echo".to_string(),
+                args: vec![id.to_string()],
             },
         }
     }

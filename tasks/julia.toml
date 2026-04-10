@@ -1,6 +1,13 @@
 id = "julia"
 label = "Julia"
 description = "Update installed Julia versions via juliaup."
+category = "toolchain"
+tags = ["language", "runtime"]
+notes = ["Uses juliaup to refresh installed Julia channels and versions."]
+
+[preflight]
+requires_commands = ["juliaup"]
+on_missing = "warn"
 
 [runner]
 kind = "script"

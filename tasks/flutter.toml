@@ -1,7 +1,18 @@
 id = "flutter"
 label = "Flutter"
 description = "Reset local Flutter SDK changes, switch to stable, and upgrade."
+category = "toolchain"
+tags = ["sdk", "destructive"]
+notes = [
+  "Pins the Flutter channel to stable before upgrading.",
+  "Uses git reset --hard and git clean -fd against the SDK checkout when it is a git repo.",
+]
 dangerous = true
+danger_message = "Resets the Flutter SDK checkout with git reset --hard and git clean -fd before upgrading."
+
+[preflight]
+requires_commands = ["flutter", "git"]
+on_missing = "warn"
 
 [runner]
 kind = "script"
