@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use chrono::{Local, TimeZone};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -15,18 +16,33 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use ratatui::{Frame, Terminal};
 
-use crate::catalog::Catalog;
-use crate::runner::{OutcomeStatus, RunOptions, RunSummary, Runner, RunnerEvent};
-use crate::tui::state::{AppState, Screen, TaskItem, TaskState};
+use crate::catalog::{Catalog, ExecutionPlan};
+use crate::persistence::{HistoryEntry, PersistedState, PersistenceStore};
+use crate::runner::{OutcomeStatus, RunOptions, Runner, RunnerEvent};
+use crate::tui::state::{AppState, CompletedRun, Screen, TaskItem, TaskState};
 
 enum AppEvent {
     Runner(RunnerEvent),
-    RunFinished(Result<RunSummary>),
+    RunFinished(CompletedRun),
 }
 
 pub fn run(root: PathBuf, catalog: Catalog, options: RunOptions) -> Result<()> {
+    let store = store_for_root(&root);
+    let (persisted, initial_load_error) = match store.load() {
+        Ok(state) => (state, None),
+        Err(error) => (PersistedState::default(), Some(error.to_string())),
+    };
+
     let mut terminal = setup_terminal()?;
-    let result = run_loop(&mut terminal, root, catalog, options);
+    let result = run_loop(
+        &mut terminal,
+        root,
+        catalog,
+        options,
+        store,
+        persisted,
+        initial_load_error,
+    );
     restore_terminal(&mut terminal)?;
     result
 }
@@ -51,12 +67,22 @@ fn run_loop(
     root: PathBuf,
     catalog: Catalog,
     options: RunOptions,
+    store: PersistenceStore,
+    persisted: PersistedState,
+    initial_load_error: Option<String>,
 ) -> Result<()> {
     let (event_tx, event_rx) = mpsc::channel();
-    let mut state = AppState::new(catalog, options);
+    let mut state = AppState::new(catalog, options, persisted);
+    if let Some(error) = initial_load_error {
+        state.set_status_message(format!("State load failed: {error}"));
+    }
 
     loop {
-        drain_app_events(&event_rx, &mut state);
+        let events_changed_state = drain_app_events(&event_rx, &mut state);
+        if events_changed_state {
+            persist_state(&store, &mut state);
+        }
+
         terminal.draw(|frame| render(frame, &state))?;
 
         if event::poll(Duration::from_millis(100))? {
@@ -65,6 +91,7 @@ fn run_loop(
                 {
                     break;
                 }
+                persist_state(&store, &mut state);
             }
         }
     }
@@ -90,8 +117,13 @@ fn handle_key(
             KeyCode::Char('v') => state.toggle_verbose(),
             KeyCode::Char('c') => state.toggle_brew_cleanup(),
             KeyCode::Char('u') => state.toggle_npm_audit(),
+            KeyCode::Char('p') | KeyCode::Tab => state.cycle_profile_next(),
+            KeyCode::BackTab => state.cycle_profile_previous(),
+            KeyCode::Char('P') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                state.cycle_profile_previous()
+            }
             KeyCode::Enter => match state.prepare_run() {
-                Ok(Some(plan)) => spawn_run(root.clone(), plan, state.options(), event_tx.clone()),
+                Ok(Some(plan)) => spawn_run(root.clone(), plan, state, event_tx.clone()),
                 Ok(None) => {}
                 Err(error) => state.set_status_message(error.to_string()),
             },
@@ -100,7 +132,7 @@ fn handle_key(
         Screen::ConfirmDangerous => match key.code {
             KeyCode::Char('y') => {
                 if let Some(plan) = state.confirm_run() {
-                    spawn_run(root.clone(), plan, state.options(), event_tx.clone());
+                    spawn_run(root.clone(), plan, state, event_tx.clone());
                 }
             }
             KeyCode::Char('n') | KeyCode::Esc => state.cancel_confirmation(),
@@ -116,7 +148,12 @@ fn handle_key(
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Enter => state.reset_after_summary(),
             KeyCode::Char('r') => match state.rerun_failed() {
-                Ok(Some(plan)) => spawn_run(root.clone(), plan, state.options(), event_tx.clone()),
+                Ok(Some(plan)) => spawn_run(root.clone(), plan, state, event_tx.clone()),
+                Ok(None) => {}
+                Err(error) => state.set_status_message(error.to_string()),
+            },
+            KeyCode::Char('l') => match state.rerun_last_profile() {
+                Ok(Some(plan)) => spawn_run(root.clone(), plan, state, event_tx.clone()),
                 Ok(None) => {}
                 Err(error) => state.set_status_message(error.to_string()),
             },
@@ -127,28 +164,60 @@ fn handle_key(
     Ok(false)
 }
 
-fn spawn_run(
-    root: PathBuf,
-    plan: crate::catalog::ExecutionPlan,
-    options: RunOptions,
-    tx: Sender<AppEvent>,
-) {
+fn spawn_run(root: PathBuf, plan: ExecutionPlan, state: &AppState, tx: Sender<AppEvent>) {
+    let selected_tasks = plan
+        .tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<Vec<_>>();
+    let profile_id = state.active_profile_id().to_string();
+    let options = state.options();
+    let started_at_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
     std::thread::spawn(move || {
+        let started = Instant::now();
         let runner = Runner::new(root);
         let mut sink = |event| {
             let _ = tx.send(AppEvent::Runner(event));
         };
-        let result = runner.run_with_events(&plan, &options, &mut sink);
-        let _ = tx.send(AppEvent::RunFinished(result));
+        let result = runner
+            .run_with_events(&plan, &options, &mut sink)
+            .map_err(|error| error.to_string());
+        let _ = tx.send(AppEvent::RunFinished(CompletedRun {
+            started_at_unix_secs,
+            duration_ms: started.elapsed().as_millis() as u64,
+            profile_id,
+            selected_tasks,
+            result,
+        }));
     });
 }
 
-fn drain_app_events(rx: &Receiver<AppEvent>, state: &mut AppState) {
+fn drain_app_events(rx: &Receiver<AppEvent>, state: &mut AppState) -> bool {
+    let mut changed = false;
     while let Ok(event) = rx.try_recv() {
         match event {
             AppEvent::Runner(event) => state.handle_runner_event(event),
-            AppEvent::RunFinished(result) => state.finish_run(result),
+            AppEvent::RunFinished(result) => {
+                state.finish_run(result);
+                changed = true;
+            }
         }
+    }
+    changed
+}
+
+fn persist_state(store: &PersistenceStore, state: &mut AppState) {
+    if !state.is_dirty() {
+        return;
+    }
+
+    match store.save(&state.snapshot()) {
+        Ok(()) => state.mark_clean(),
+        Err(error) => state.set_status_message(format!("State save failed: {error}")),
     }
 }
 
@@ -157,7 +226,7 @@ fn render(frame: &mut Frame, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(12),
+            Constraint::Min(14),
             Constraint::Length(10),
             Constraint::Length(2),
         ])
@@ -184,11 +253,12 @@ fn render_title(frame: &mut Frame, area: Rect, state: &AppState) {
         Screen::Running => 2,
         Screen::Summary => 3,
     };
+    let title = format!(" Upgrade Cockpit [{}] ", state.active_profile().label);
     let tabs = Tabs::new(titles)
         .select(active)
         .block(
             Block::default()
-                .title(" Upgrade Cockpit ")
+                .title(title)
                 .title_alignment(ratatui::layout::Alignment::Center)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
@@ -201,7 +271,7 @@ fn render_title(frame: &mut Frame, area: Rect, state: &AppState) {
 fn render_main(frame: &mut Frame, area: Rect, state: &AppState) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(area);
 
     render_tasks(frame, columns[0], state);
@@ -254,8 +324,23 @@ fn task_line(task: &TaskItem) -> Line<'static> {
 fn render_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     match state.screen() {
         Screen::Summary => render_summary(frame, area, state),
-        _ => render_task_detail(frame, area, state),
+        _ => render_select_detail(frame, area, state),
     }
+}
+
+fn render_select_detail(frame: &mut Frame, area: Rect, state: &AppState) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(10),
+            Constraint::Length(7),
+            Constraint::Min(6),
+        ])
+        .split(area);
+
+    render_task_detail(frame, sections[0], state);
+    render_profile_panel(frame, sections[1], state);
+    render_history_panel(frame, sections[2], state.history());
 }
 
 fn render_task_detail(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -265,7 +350,7 @@ fn render_task_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     } else {
         task.dependencies.join(", ")
     };
-    let flags = [
+    let flags = vec![
         flag_span("dry-run", state.options().dry_run),
         flag_span("verbose", state.options().verbose),
         flag_span("brew-cleanup", state.options().brew_cleanup),
@@ -295,14 +380,7 @@ fn render_task_detail(frame: &mut Frame, area: Rect, state: &AppState) {
             Span::raw(dependencies),
         ]),
         Line::raw(""),
-        Line::from(flags.to_vec()),
-        Line::raw(""),
-        Line::from(match state.screen() {
-            Screen::Select => "Enter run   Space toggle   a all   x none".to_string(),
-            Screen::ConfirmDangerous => "y confirm   n cancel".to_string(),
-            Screen::Running => "Current task output is streaming below.".to_string(),
-            Screen::Summary => String::new(),
-        }),
+        Line::from(flags),
     ];
 
     let paragraph = Paragraph::new(lines)
@@ -316,7 +394,85 @@ fn render_task_detail(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(paragraph, area);
 }
 
+fn render_profile_panel(frame: &mut Frame, area: Rect, state: &AppState) {
+    let profile = state.active_profile();
+    let selections = if profile.selected_tasks.is_empty() {
+        "none".to_string()
+    } else {
+        profile.selected_tasks.join(", ")
+    };
+
+    let paragraph = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                profile.label.clone(),
+                Style::default().fg(Color::Cyan).bold(),
+            ),
+            Span::raw(" "),
+            Span::styled(profile.id.clone(), Style::default().fg(Color::Gray)),
+        ]),
+        Line::raw(""),
+        Line::raw(profile.description.clone()),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("Selection: ", Style::default().fg(Color::Gray)),
+            Span::raw(selections),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .title(" Profile ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Blue)),
+    )
+    .wrap(Wrap { trim: true });
+
+    frame.render_widget(paragraph, area);
+}
+
+fn render_history_panel(frame: &mut Frame, area: Rect, history: &[HistoryEntry]) {
+    let mut lines = Vec::new();
+    if history.is_empty() {
+        lines.push(Line::styled(
+            "No runs recorded yet.",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        for entry in history.iter().rev().take(5) {
+            lines.push(Line::from(vec![
+                Span::styled(format_history_time(entry), Style::default().fg(Color::Cyan)),
+                Span::raw("  "),
+                Span::styled(entry.profile_id.clone(), Style::default().fg(Color::White)),
+                Span::raw("  "),
+                Span::styled(
+                    format!(
+                        "{} / {} / {}",
+                        entry.summary.ok_count, entry.summary.warn_count, entry.summary.fail_count
+                    ),
+                    outcome_style(entry.summary.overall_status()),
+                ),
+                Span::raw(format!("  {} ms", entry.duration_ms)),
+            ]));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Recent Runs ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Blue)),
+        )
+        .wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, area);
+}
+
 fn render_summary(frame: &mut Frame, area: Rect, state: &AppState) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(10), Constraint::Min(6)])
+        .split(area);
+
     let mut lines = Vec::new();
     if let Some(summary) = state.summary() {
         lines.push(Line::from(vec![
@@ -338,7 +494,7 @@ fn render_summary(frame: &mut Frame, area: Rect, state: &AppState) {
         }
         lines.push(Line::raw(""));
         lines.push(Line::raw(
-            "Enter return to selection   r rerun failed   q quit",
+            "Enter return to selection   r rerun failed   l rerun last profile   q quit",
         ));
     } else if let Some(message) = state.status_message() {
         lines.push(Line::raw(message.to_string()));
@@ -346,7 +502,7 @@ fn render_summary(frame: &mut Frame, area: Rect, state: &AppState) {
         lines.push(Line::raw("Enter return to selection   q quit"));
     }
 
-    let paragraph = Paragraph::new(lines)
+    let summary = Paragraph::new(lines)
         .block(
             Block::default()
                 .title(" Summary ")
@@ -354,7 +510,8 @@ fn render_summary(frame: &mut Frame, area: Rect, state: &AppState) {
                 .border_style(Style::default().fg(Color::Blue)),
         )
         .wrap(Wrap { trim: true });
-    frame.render_widget(paragraph, area);
+    frame.render_widget(summary, sections[0]);
+    render_history_panel(frame, sections[1], state.history());
 }
 
 fn render_logs(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -391,11 +548,11 @@ fn render_logs(frame: &mut Frame, area: Rect, state: &AppState) {
 fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
     let message = state.status_message().unwrap_or(match state.screen() {
         Screen::Select => {
-            "j/k move   space toggle   d dry-run   v verbose   c cleanup   u audit   q quit"
+            "j/k move   space toggle   p next profile   shift+p prev   d/v/c/u flags   enter run   q quit"
         }
         Screen::ConfirmDangerous => "Dangerous tasks need confirmation.",
         Screen::Running => "Task output streams in real time. Quit is disabled while running.",
-        Screen::Summary => "Review the summary, then quit or return to selection.",
+        Screen::Summary => "Review the summary, rerun what you need, or return to selection.",
     });
 
     let paragraph = Paragraph::new(message)
@@ -478,4 +635,16 @@ fn flag_span(label: &'static str, enabled: bool) -> Span<'static> {
             Style::default().fg(Color::Gray).bg(Color::Rgb(28, 36, 49)),
         )
     }
+}
+
+fn format_history_time(entry: &HistoryEntry) -> String {
+    Local
+        .timestamp_opt(entry.started_at_unix_secs as i64, 0)
+        .single()
+        .map(|time| time.format("%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| entry.started_at_unix_secs.to_string())
+}
+
+fn store_for_root(root: &std::path::Path) -> PersistenceStore {
+    PersistenceStore::new(root.join(".upgrade-cockpit").join("state.toml"))
 }

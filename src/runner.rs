@@ -5,16 +5,21 @@ use std::sync::mpsc;
 use std::thread;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::catalog::{ExecutionPlan, TaskDefinition, TaskRunner};
 
 const WARN_EXIT_CODE: i32 = 10;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RunOptions {
+    #[serde(default)]
     pub dry_run: bool,
+    #[serde(default)]
     pub verbose: bool,
+    #[serde(default)]
     pub brew_cleanup: bool,
+    #[serde(default)]
     pub npm_audit: bool,
 }
 
