@@ -8,14 +8,15 @@ A Rust-powered terminal cockpit for running scripted system updates without turn
 
 - update tasks are defined as manifests in `tasks/`
 - each task runs a script or command from `scripts/`
-- Rust handles planning, dependency ordering, profiles, summaries, history, and the terminal UI
-- the default interactive experience is a ratatui control panel with live logs, recent runs, and per-task status
+- Rust handles planning, dependency ordering, profiles, preflight checks, summaries, history, and the terminal UI
+- the default interactive experience is a ratatui control panel with live logs, recent runs, per-task status, and task safety notes
 
 ## Project Shape
 
 - `src/runner.rs` executes tasks and classifies `OK`, `WARN`, and `FAIL` outcomes
 - `src/profiles.rs` defines the built-in maintenance profiles
 - `src/persistence.rs` stores saved defaults and recent run history
+- `src/catalog.rs` loads task metadata, tags, notes, and preflight requirements from manifests
 - `src/tui/` contains the interactive shell and state model
 - `tasks/` declares what exists and how tasks depend on each other
 - `scripts/` preserves the shell-native behavior for tools like `nvm`, `sdkman`, `brew`, and `flutter`
@@ -47,3 +48,7 @@ cargo run -- --dry-run run
 ## State
 
 The TUI saves its current profile, custom selection, flags, and recent run history to `.upgrade-cockpit/state.toml` in the project root.
+
+## Task Metadata
+
+Tasks can declare categories, tags, notes, danger messages, and preflight requirements directly in their `tasks/*.toml` manifests. The runner uses that metadata to warn or fail early when required tools are missing, and the TUI surfaces the same information before you launch a task.
