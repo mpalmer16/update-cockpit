@@ -182,6 +182,54 @@ impl Runner {
         })
     }
 
+    pub fn run_interactive_with_events<S>(
+        &self,
+        plan: &ExecutionPlan,
+        options: &RunOptions,
+        sink: &mut S,
+    ) -> Result<RunSummary>
+    where
+        S: EventSink,
+    {
+        let mut outcomes = Vec::new();
+        let mut ok_count = 0;
+        let mut warn_count = 0;
+        let mut fail_count = 0;
+
+        for task in &plan.tasks {
+            sink.handle(RunnerEvent::TaskStarted {
+                task_id: task.id.clone(),
+                label: task.label.clone(),
+            });
+
+            let status = self.run_task_interactive(task, options, sink)?;
+            match status {
+                OutcomeStatus::Ok => ok_count += 1,
+                OutcomeStatus::Warn => warn_count += 1,
+                OutcomeStatus::Fail => fail_count += 1,
+            }
+
+            sink.handle(RunnerEvent::TaskFinished {
+                task_id: task.id.clone(),
+                label: task.label.clone(),
+                status,
+            });
+
+            outcomes.push(TaskOutcome {
+                id: task.id.clone(),
+                label: task.label.clone(),
+                status,
+            });
+        }
+
+        Ok(RunSummary {
+            outcomes,
+            ok_count,
+            warn_count,
+            fail_count,
+        })
+    }
+
     fn run_task(&self, task: &TaskDefinition, options: &RunOptions) -> Result<OutcomeStatus> {
         let preflight = evaluate_preflight(task)?;
         for message in &preflight.messages {
@@ -262,6 +310,38 @@ impl Runner {
         stderr_thread.join().expect("stderr reader panicked")?;
 
         let status = child.wait().context("failed to wait on task process")?;
+        Ok(classify_exit_code(status.code().unwrap_or(1)))
+    }
+
+    fn run_task_interactive<S>(
+        &self,
+        task: &TaskDefinition,
+        options: &RunOptions,
+        sink: &mut S,
+    ) -> Result<OutcomeStatus>
+    where
+        S: EventSink,
+    {
+        let preflight = evaluate_preflight(task)?;
+        for message in &preflight.messages {
+            sink.handle(RunnerEvent::OutputLine {
+                task_id: task.id.clone(),
+                stream: StreamKind::Stderr,
+                line: message.clone(),
+            });
+        }
+        if let Some(status) = preflight.status {
+            return Ok(status);
+        }
+
+        let mut command = build_command(task, &self.root, options);
+        command.stdin(Stdio::inherit());
+        command.stdout(Stdio::inherit());
+        command.stderr(Stdio::inherit());
+
+        let status = command
+            .status()
+            .with_context(|| format!("failed to execute task {}", task.id))?;
         Ok(classify_exit_code(status.code().unwrap_or(1)))
     }
 }
@@ -576,6 +656,44 @@ exit 0
                 status: OutcomeStatus::Ok,
                 ..
             }) if task_id == "events"
+        ));
+    }
+
+    #[test]
+    fn emits_interactive_runner_events() {
+        let root = TempDir::new().expect("tempdir");
+        let scripts_dir = root.path().join("scripts");
+        fs::create_dir(&scripts_dir).expect("create scripts dir");
+
+        write_script(
+            &scripts_dir.join("interactive-events.sh"),
+            r#"#!/bin/sh
+echo "visible output"
+exit 0
+"#,
+        );
+
+        let plan = ExecutionPlan {
+            tasks: vec![task("interactive", "scripts/interactive-events.sh")],
+        };
+        let mut events = Vec::new();
+
+        let summary = Runner::new(root.path().to_path_buf())
+            .run_interactive_with_events(&plan, &default_options(), &mut |event| events.push(event))
+            .expect("run task");
+
+        assert_eq!(summary.ok_count, 1);
+        assert!(matches!(
+            events.first(),
+            Some(RunnerEvent::TaskStarted { task_id, .. }) if task_id == "interactive"
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(RunnerEvent::TaskFinished {
+                task_id,
+                status: OutcomeStatus::Ok,
+                ..
+            }) if task_id == "interactive"
         ));
     }
 
