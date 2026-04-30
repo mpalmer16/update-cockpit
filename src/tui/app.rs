@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -23,11 +22,6 @@ use crate::tui::state::{
     AppState, AvailabilityState, CompletedRun, Screen, TaskItem, TaskListEntry, TaskState,
 };
 
-enum AppEvent {
-    Runner(RunnerEvent),
-    RunFinished(CompletedRun),
-}
-
 pub fn run(root: PathBuf, catalog: Catalog, options: RunOptions) -> Result<()> {
     let store = store_for_root(&root);
     let (persisted, initial_load_error) = match store.load() {
@@ -45,19 +39,27 @@ pub fn run(root: PathBuf, catalog: Catalog, options: RunOptions) -> Result<()> {
         persisted,
         initial_load_error,
     );
-    restore_terminal(&mut terminal)?;
+    deactivate_terminal(&mut terminal)?;
     result
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    let stdout = std::io::stdout();
     let backend = CrosstermBackend::new(stdout);
-    Ok(Terminal::new(backend)?)
+    let mut terminal = Terminal::new(backend)?;
+    activate_terminal(&mut terminal)?;
+    Ok(terminal)
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+fn activate_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.hide_cursor()?;
+    terminal.clear()?;
+    Ok(())
+}
+
+fn deactivate_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -73,23 +75,18 @@ fn run_loop(
     persisted: PersistedState,
     initial_load_error: Option<String>,
 ) -> Result<()> {
-    let (event_tx, event_rx) = mpsc::channel();
     let mut state = AppState::new(catalog, options, persisted);
     if let Some(error) = initial_load_error {
         state.set_status_message(format!("State load failed: {error}"));
     }
 
     loop {
-        let events_changed_state = drain_app_events(&event_rx, &mut state);
-        if events_changed_state {
-            persist_state(&store, &mut state);
-        }
-
         terminal.draw(|frame| render(frame, &state))?;
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press && handle_key(key, &root, &event_tx, &mut state)?
+                if key.kind == KeyEventKind::Press
+                    && handle_key(key, terminal, &root, &store, &mut state)?
                 {
                     break;
                 }
@@ -103,8 +100,9 @@ fn run_loop(
 
 fn handle_key(
     key: KeyEvent,
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     root: &PathBuf,
-    event_tx: &Sender<AppEvent>,
+    store: &PersistenceStore,
     state: &mut AppState,
 ) -> Result<bool> {
     match state.screen() {
@@ -133,7 +131,7 @@ fn handle_key(
             }
             KeyCode::Char('z') => state.clear_filters(),
             KeyCode::Enter => match state.prepare_run() {
-                Ok(Some(plan)) => spawn_run(root.clone(), plan, state, event_tx.clone()),
+                Ok(Some(plan)) => run_selected_tasks(terminal, root, store, plan, state)?,
                 Ok(None) => {}
                 Err(error) => state.set_status_message(error.to_string()),
             },
@@ -142,7 +140,7 @@ fn handle_key(
         Screen::ConfirmDangerous => match key.code {
             KeyCode::Char('y') => {
                 if let Some(plan) = state.confirm_run() {
-                    spawn_run(root.clone(), plan, state, event_tx.clone());
+                    run_selected_tasks(terminal, root, store, plan, state)?;
                 }
             }
             KeyCode::Char('n') | KeyCode::Esc => state.cancel_confirmation(),
@@ -158,12 +156,12 @@ fn handle_key(
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Enter => state.reset_after_summary(),
             KeyCode::Char('r') => match state.rerun_failed() {
-                Ok(Some(plan)) => spawn_run(root.clone(), plan, state, event_tx.clone()),
+                Ok(Some(plan)) => run_selected_tasks(terminal, root, store, plan, state)?,
                 Ok(None) => {}
                 Err(error) => state.set_status_message(error.to_string()),
             },
             KeyCode::Char('l') => match state.rerun_last_profile() {
-                Ok(Some(plan)) => spawn_run(root.clone(), plan, state, event_tx.clone()),
+                Ok(Some(plan)) => run_selected_tasks(terminal, root, store, plan, state)?,
                 Ok(None) => {}
                 Err(error) => state.set_status_message(error.to_string()),
             },
@@ -174,7 +172,13 @@ fn handle_key(
     Ok(false)
 }
 
-fn spawn_run(root: PathBuf, plan: ExecutionPlan, state: &AppState, tx: Sender<AppEvent>) {
+fn run_selected_tasks(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    root: &PathBuf,
+    store: &PersistenceStore,
+    plan: ExecutionPlan,
+    state: &mut AppState,
+) -> Result<()> {
     let selected_tasks = plan
         .tasks
         .iter()
@@ -186,38 +190,37 @@ fn spawn_run(root: PathBuf, plan: ExecutionPlan, state: &AppState, tx: Sender<Ap
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let started = Instant::now();
 
-    std::thread::spawn(move || {
-        let started = Instant::now();
-        let runner = Runner::new(root);
+    persist_state(store, state);
+    deactivate_terminal(terminal)?;
+
+    println!("upgrade-cockpit released the terminal for task output.");
+    println!("The summary screen will return when the run finishes.");
+    println!();
+
+    let runner = Runner::new(root.clone());
+    let result = {
         let mut sink = |event| {
-            let _ = tx.send(AppEvent::Runner(event));
+            print_runner_event(&event);
+            state.handle_runner_event(event);
         };
-        let result = runner
-            .run_with_events(&plan, &options, &mut sink)
-            .map_err(|error| error.to_string());
-        let _ = tx.send(AppEvent::RunFinished(CompletedRun {
-            started_at_unix_secs,
-            duration_ms: started.elapsed().as_millis() as u64,
-            profile_id,
-            selected_tasks,
-            result,
-        }));
-    });
-}
+        runner
+            .run_interactive_with_events(&plan, &options, &mut sink)
+            .map_err(|error| error.to_string())
+    };
 
-fn drain_app_events(rx: &Receiver<AppEvent>, state: &mut AppState) -> bool {
-    let mut changed = false;
-    while let Ok(event) = rx.try_recv() {
-        match event {
-            AppEvent::Runner(event) => state.handle_runner_event(event),
-            AppEvent::RunFinished(result) => {
-                state.finish_run(result);
-                changed = true;
-            }
-        }
-    }
-    changed
+    activate_terminal(terminal)?;
+
+    state.finish_run(CompletedRun {
+        started_at_unix_secs,
+        duration_ms: started.elapsed().as_millis() as u64,
+        profile_id,
+        selected_tasks,
+        result,
+    });
+    persist_state(store, state);
+    Ok(())
 }
 
 fn persist_state(store: &PersistenceStore, state: &mut AppState) {
@@ -228,6 +231,22 @@ fn persist_state(store: &PersistenceStore, state: &mut AppState) {
     match store.save(&state.snapshot()) {
         Ok(()) => state.mark_clean(),
         Err(error) => state.set_status_message(format!("State save failed: {error}")),
+    }
+}
+
+fn print_runner_event(event: &RunnerEvent) {
+    match event {
+        RunnerEvent::TaskStarted { label, .. } => {
+            println!("==> {label}");
+        }
+        RunnerEvent::OutputLine { stream, line, .. } => match stream {
+            crate::runner::StreamKind::Stdout => println!("{line}"),
+            crate::runner::StreamKind::Stderr => eprintln!("{line}"),
+        },
+        RunnerEvent::TaskFinished { label, status, .. } => {
+            println!("{label} finished: {}", status.label());
+            println!();
+        }
     }
 }
 
