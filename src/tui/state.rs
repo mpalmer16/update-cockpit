@@ -1133,6 +1133,73 @@ mod tests {
     }
 
     #[test]
+    fn reset_after_summary_returns_to_a_clean_selection_screen() {
+        let mut state = AppState::new(
+            catalog_fixture(),
+            RunOptions::default(),
+            PersistedState::default(),
+        );
+        state.tasks[0].state = TaskState::Ok;
+        state.finish_run(CompletedRun {
+            started_at_unix_secs: 10,
+            duration_ms: 500,
+            profile_id: "custom".to_string(),
+            selected_tasks: vec!["brew".to_string()],
+            result: Ok(RunSummary {
+                outcomes: vec![TaskOutcome {
+                    id: "brew".to_string(),
+                    label: "Homebrew".to_string(),
+                    status: OutcomeStatus::Ok,
+                }],
+                ok_count: 1,
+                warn_count: 0,
+                fail_count: 0,
+            }),
+        });
+
+        state.reset_after_summary();
+
+        assert_eq!(state.screen(), Screen::Select);
+        assert!(state.summary().is_none());
+        assert!(state.status_message().is_none());
+        assert!(state.logs().is_empty());
+        assert!(
+            state
+                .tasks()
+                .iter()
+                .all(|task| task.state == TaskState::Pending)
+        );
+    }
+
+    #[test]
+    fn failed_run_goes_to_summary_without_history_entry() {
+        let mut state = AppState::new(
+            catalog_fixture(),
+            RunOptions::default(),
+            PersistedState::default(),
+        );
+
+        state.finish_run(CompletedRun {
+            started_at_unix_secs: 10,
+            duration_ms: 500,
+            profile_id: "custom".to_string(),
+            selected_tasks: vec!["brew".to_string()],
+            result: Err("runner crashed".to_string()),
+        });
+
+        assert_eq!(state.screen(), Screen::Summary);
+        assert_eq!(state.status_message(), Some("Run failed: runner crashed"));
+        assert!(state.summary().is_none());
+        assert!(state.history().is_empty());
+        assert!(
+            state
+                .logs()
+                .iter()
+                .any(|line| line == "fatal: runner crashed")
+        );
+    }
+
+    #[test]
     fn reruns_only_failed_tasks() {
         let mut state = AppState::new(
             catalog_fixture(),
