@@ -639,6 +639,13 @@ fn render_summary(frame: &mut Frame, area: Rect, state: &AppState) {
 
     let mut lines = Vec::new();
     if let Some(summary) = state.summary() {
+        if let Some(message) = state.status_message() {
+            lines.push(Line::styled(
+                message.to_string(),
+                Style::default().fg(Color::Cyan).bold(),
+            ));
+            lines.push(Line::raw(""));
+        }
         lines.push(Line::from(vec![
             Span::styled("OK ", Style::default().fg(Color::Green).bold()),
             Span::raw(summary.ok_count.to_string()),
@@ -656,14 +663,8 @@ fn render_summary(frame: &mut Frame, area: Rect, state: &AppState) {
                 Span::styled(outcome.status.label(), outcome_style(outcome.status)),
             ]));
         }
-        lines.push(Line::raw(""));
-        lines.push(Line::raw(
-            "Enter return to selection   r rerun failed   l rerun last profile   q quit",
-        ));
     } else if let Some(message) = state.status_message() {
         lines.push(Line::raw(message.to_string()));
-        lines.push(Line::raw(""));
-        lines.push(Line::raw("Enter return to selection   q quit"));
     }
 
     let summary = Paragraph::new(lines)
@@ -679,29 +680,48 @@ fn render_summary(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_logs(frame: &mut Frame, area: Rect, state: &AppState) {
-    let lines = if state.logs().is_empty() {
-        vec![Line::styled(
-            "No output yet.",
+    let mut lines = Vec::new();
+    if matches!(state.screen(), Screen::Summary) && state.summary().is_some() {
+        lines.push(Line::styled(
+            "Task output was shown directly in the terminal during the run.",
+            Style::default().fg(Color::Cyan),
+        ));
+        lines.push(Line::styled(
+            "This panel keeps cockpit-level activity such as task starts, finishes, and preflight warnings.",
             Style::default().fg(Color::DarkGray),
-        )]
+        ));
+        lines.push(Line::raw(""));
+    }
+
+    if state.logs().is_empty() {
+        lines.push(Line::styled(
+            "No activity yet.",
+            Style::default().fg(Color::DarkGray),
+        ));
     } else {
-        state
-            .logs()
-            .iter()
-            .rev()
-            .take((area.height.saturating_sub(2)) as usize)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(Line::raw)
-            .collect::<Vec<_>>()
-    };
+        let available_lines = area.height.saturating_sub(2) as usize;
+        let reserved = lines.len();
+        let log_capacity = available_lines.saturating_sub(reserved);
+        if log_capacity > 0 {
+            lines.extend(
+                state
+                    .logs()
+                    .iter()
+                    .rev()
+                    .take(log_capacity)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .map(Line::raw),
+            );
+        }
+    }
 
     let paragraph = Paragraph::new(lines)
         .block(
             Block::default()
-                .title(" Live Log ")
+                .title(" Activity ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Blue)),
         )
@@ -710,18 +730,27 @@ fn render_logs(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
-    let message = state.status_message().unwrap_or(match state.screen() {
+    let status = state.status_message().unwrap_or(match state.screen() {
+        Screen::Select => "Choose tasks, adjust filters, and launch a run.",
+        Screen::ConfirmDangerous => "Dangerous tasks need confirmation.",
+        Screen::Running => "Wait for the current run to finish.",
+        Screen::Summary => "Review the summary or rerun what you need.",
+    });
+    let keybindings = match state.screen() {
         Screen::Select => {
             "j/k move   space toggle   p profile   f scope   g category   t tag   z clear   enter run   q quit"
         }
-        Screen::ConfirmDangerous => "Dangerous tasks need confirmation.",
-        Screen::Running => "Task output streams in real time. Quit is disabled while running.",
-        Screen::Summary => "Review the summary, rerun what you need, or return to selection.",
-    });
+        Screen::ConfirmDangerous => "y continue   n cancel",
+        Screen::Running => "running   terminal control is with the updater",
+        Screen::Summary => "enter selection   r rerun failed   l rerun last profile   q quit",
+    };
 
-    let paragraph = Paragraph::new(message)
-        .style(Style::default().fg(Color::White).bg(Color::Rgb(28, 36, 49)))
-        .wrap(Wrap { trim: true });
+    let paragraph = Paragraph::new(vec![
+        Line::raw(status.to_string()),
+        Line::styled(keybindings, Style::default().fg(Color::Gray)),
+    ])
+    .style(Style::default().fg(Color::White).bg(Color::Rgb(28, 36, 49)))
+    .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
 }
 
