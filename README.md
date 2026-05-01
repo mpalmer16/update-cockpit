@@ -30,6 +30,7 @@ cargo run -- tui
 cargo run -- list
 cargo run -- plan npm-tools
 cargo run -- --dry-run run
+cargo test
 ```
 
 ## TUI Controls
@@ -54,6 +55,46 @@ cargo run -- --dry-run run
 
 The TUI saves its current profile, custom selection, flags, and recent run history to `.upgrade-cockpit/state.toml` in the project root.
 
+## Terminal Behavior
+
+During a run, `upgrade-cockpit` temporarily leaves the TUI and gives the terminal back to the task process. That keeps interactive tools like SDKMAN, Homebrew, and language managers usable when they need to ask a question.
+
+When the run finishes, the TUI returns to a summary screen. The Activity panel records cockpit-level events such as task starts, task finishes, preflight warnings, and fatal errors. Full stdout/stderr is shown directly in the terminal during the run instead of being captured into the TUI.
+
 ## Task Metadata
 
 Tasks can declare categories, tags, notes, danger messages, and preflight requirements directly in their `tasks/*.toml` manifests. The runner uses that metadata to warn or fail early when required tools are missing, and the TUI surfaces the same information before you launch a task.
+
+Example:
+
+```toml
+id = "rust"
+label = "Rust"
+description = "Update Rust toolchains with rustup."
+category = "toolchain"
+tags = ["rust", "runtime"]
+default_selected = true
+
+[preflight]
+requires_commands = ["rustup"]
+on_missing = "warn"
+
+[runner]
+kind = "script"
+path = "scripts/rust.zsh"
+```
+
+## Testing
+
+The test suite focuses on the stable contracts that make the cockpit safe to evolve:
+
+- catalog loading, manifest validation, dependency ordering, and cycle detection
+- runner outcome classification, preflight behavior, event emission, and interactive task execution
+- persisted state, profile selection, run history, and history trimming
+- TUI state transitions for selection, filters, dangerous confirmations, summaries, and rerun flows
+
+Run the suite with:
+
+```bash
+cargo test
+```

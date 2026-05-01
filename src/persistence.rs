@@ -207,10 +207,12 @@ mod tests {
     fn trims_history_on_save() {
         let temp = TempDir::new().expect("tempdir");
         let store = PersistenceStore::new(temp.path().join("state.toml"));
-        let mut state = PersistedState::default();
-        state.history = (0..(MAX_HISTORY_ENTRIES + 3))
-            .map(|index| history_entry(index as u64))
-            .collect();
+        let state = PersistedState {
+            history: (0..(MAX_HISTORY_ENTRIES + 3))
+                .map(|index| history_entry(index as u64))
+                .collect(),
+            ..PersistedState::default()
+        };
 
         store.save(&state).expect("save state");
         let loaded = store.load().expect("load state");

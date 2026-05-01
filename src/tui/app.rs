@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -83,15 +83,15 @@ fn run_loop(
     loop {
         terminal.draw(|frame| render(frame, &state))?;
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press
-                    && handle_key(key, terminal, &root, &store, &mut state)?
-                {
-                    break;
-                }
-                persist_state(&store, &mut state);
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind == KeyEventKind::Press
+                && handle_key(key, terminal, &root, &store, &mut state)?
+            {
+                break;
             }
+            persist_state(&store, &mut state);
         }
     }
 
@@ -101,7 +101,7 @@ fn run_loop(
 fn handle_key(
     key: KeyEvent,
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    root: &PathBuf,
+    root: &Path,
     store: &PersistenceStore,
     state: &mut AppState,
 ) -> Result<bool> {
@@ -174,7 +174,7 @@ fn handle_key(
 
 fn run_selected_tasks(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    root: &PathBuf,
+    root: &Path,
     store: &PersistenceStore,
     plan: ExecutionPlan,
     state: &mut AppState,
@@ -199,7 +199,7 @@ fn run_selected_tasks(
     println!("The summary screen will return when the run finishes.");
     println!();
 
-    let runner = Runner::new(root.clone());
+    let runner = Runner::new(root.to_path_buf());
     let result = {
         let mut sink = |event| {
             print_runner_event(&event);

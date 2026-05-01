@@ -668,7 +668,7 @@ exit 0
         write_script(
             &scripts_dir.join("interactive-events.sh"),
             r#"#!/bin/sh
-echo "visible output"
+printf "ran" > interactive-output.txt
 exit 0
 "#,
         );
@@ -683,6 +683,10 @@ exit 0
             .expect("run task");
 
         assert_eq!(summary.ok_count, 1);
+        assert_eq!(
+            fs::read_to_string(root.path().join("interactive-output.txt")).expect("read output"),
+            "ran"
+        );
         assert!(matches!(
             events.first(),
             Some(RunnerEvent::TaskStarted { task_id, .. }) if task_id == "interactive"
@@ -694,6 +698,46 @@ exit 0
                 status: OutcomeStatus::Ok,
                 ..
             }) if task_id == "interactive"
+        ));
+    }
+
+    #[test]
+    fn interactive_runner_reports_preflight_messages() {
+        let root = TempDir::new().expect("tempdir");
+        let plan = ExecutionPlan {
+            tasks: vec![task_with_preflight(
+                "missing",
+                TaskPreflight {
+                    requires_commands: vec!["definitely-not-installed-upgrade-cockpit".to_string()],
+                    requires_paths: Vec::new(),
+                    on_missing: MissingRequirementPolicy::Warn,
+                },
+            )],
+        };
+        let mut events = Vec::new();
+
+        let summary = Runner::new(root.path().to_path_buf())
+            .run_interactive_with_events(&plan, &default_options(), &mut |event| events.push(event))
+            .expect("run task");
+
+        assert_eq!(summary.warn_count, 1);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                RunnerEvent::OutputLine {
+                    task_id,
+                    stream: StreamKind::Stderr,
+                    line,
+                } if task_id == "missing" && line.contains("Missing command")
+            )
+        }));
+        assert!(matches!(
+            events.last(),
+            Some(RunnerEvent::TaskFinished {
+                task_id,
+                status: OutcomeStatus::Warn,
+                ..
+            }) if task_id == "missing"
         ));
     }
 
